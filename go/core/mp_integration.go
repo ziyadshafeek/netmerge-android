@@ -11,7 +11,15 @@ func (b *protectorBinder) BindAndProtect(fd int64, networkType int) bool {
 	if b.p == nil {
 		return false
 	}
-	return b.p.BindAndProtect(int(fd), networkType)
+	if b.p.BindAndProtect(int(fd), networkType) {
+		return true
+	}
+	// Kotlin had no live Network ref (cold start / transient onLost gap):
+	// protect from the VPN and let the OS route instead of aborting the
+	// dial. Mirrors core.dialBound's unpinned fallback; the socket stays
+	// protected so there is no routing loop.
+	b.p.Protect(int(fd))
+	return true
 }
 
 // newMultipathEngine creates the on-phone compounding engine using the
