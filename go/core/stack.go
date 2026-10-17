@@ -240,49 +240,51 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 	// promoting to a permanent address fixes the return path.
 	// Duplicate adds are harmless (ErrDuplicateAddress is ignored).
 	e.ensureAddr(id.LocalAddress)
-	f := familyOf(id.LocalAddress)
 	host := tcpipToIP(id.LocalAddress).String()
-	port := int(id.LocalPort)
+	port := uint16(id.LocalPort)
 
-	// Check if this is a synthetic VIP from our DNS interceptor.
-	// If so, use the DualEndpoint for dual-link dialing.
-	var upstream net.Conn
-	var slot *Slot
-	var err error
-
-	if e.mpEngine != nil {
-		if dualEP := e.mpEngine.DNS.LookupVIP(host); dualEP != nil {
-			// VIP hit: race both links via the bound dialer
-			ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-			defer cancel()
-			binder := &protectorBinder{p: e.protector}
-			upstream, _, err = multipath.DialRace(ctx, binder, dualEP.WiFiAddr, dualEP.CellAddr, strconv.Itoa(port))
-			if err == nil {
-				// For VIP flows, we don't use the legacy scheduler slot
-				// (the multipath engine manages link selection)
-				slot = nil
-			}
-		}
-	}
-
-	// Fallback to legacy single-link dial if not a VIP or race failed
-	if upstream == nil {
-		upstream, slot, err = e.dialTCP(f, host, port)
-		if err != nil {
-			r.Complete(true) // RST: no usable network
-			return
-		}
-	}
 	var wq waiter.Queue
 	ep, terr := r.CreateEndpoint(&wq)
 	if terr != nil {
-		upstream.Close()
-		e.scheduler.ReleaseFor(slot, f)
 		r.Complete(true)
 		return
 	}
 	r.Complete(false)
 	tunConn := gonet.NewTCPConn(&wq, ep)
+
+	// Use the multipath compound engine for full on-phone compounding:
+	// - DNS VIP anti-coalescing (already done via DNS interceptor)
+	// - Dual-link SYN racing with ClientHello replay for TLS/banking
+	// - HalvingSplicer for HTTP range compounding
+	// - All with zero TLS interception, zero Root CA
+	if e.mpEngine != nil {
+		// Look up DualEndpoint for this VIP (or create from literal IP)
+		dualEP := e.mpEngine.DNS.LookupVIP(host)
+		if dualEP == nil {
+			// Direct IP connection (not a VIP): use literal IP on both links
+			// The resolver will have resolved it via the background DNS
+			dualEP = &multipath.DualEndpoint{
+				Domain:   host,
+				WiFiAddr: host,
+				CellAddr: host,
+			}
+		}
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			_ = e.mpEngine.HandleGVisorTCPStream(ctx, tunConn, dualEP, port)
+		}()
+		return
+	}
+
+	// Fallback: legacy single-link path (should not happen)
+	f := familyOf(id.LocalAddress)
+	upstream, slot, err := e.dialTCP(f, host, int(port))
+	if err != nil {
+		tunConn.Close()
+		return
+	}
 	e.relayTCP(tunConn, upstream, slot, f)
 }
 

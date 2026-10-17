@@ -16,16 +16,19 @@ type raceResult struct {
 	err  error
 }
 
-// DialRace dials the same target across Wi-Fi and Cellular in parallel
-// (Happy Eyeballs style) and returns the winner — the first to complete
-// the TCP handshake. The loser is closed.
+// DialSpeculativeDualLink dials both Wi-Fi and Cellular in parallel and
+// returns the winner immediately, plus a channel for the standby (loser)
+// connection. The caller owns both connections and must close them.
 //
-// binder binds each socket to its physical link. wifiAddr and cellAddr are
-// the per-link destination IPs (from DualEndpoint); either may be empty,
-// in which case that link is skipped.
-//
-// If both dials fail, the first error is returned.
-func DialRace(ctx context.Context, binder SocketBinder, wifiAddr, cellAddr, port string) (net.Conn, LinkType, error) {
+// If the winner fails, the caller can use the standby. If only one link
+// has an address, the standby channel is closed immediately.
+func DialSpeculativeDualLink(
+	ctx context.Context,
+	binder SocketBinder,
+	ep *DualEndpoint,
+	port string,
+	preferred LinkType,
+) (winner net.Conn, winnerLink LinkType, standbyCh <-chan raceResult, err error) {
 	ch := make(chan raceResult, 2)
 
 	dialOne := func(link LinkType, ip string) {
@@ -33,47 +36,77 @@ func DialRace(ctx context.Context, binder SocketBinder, wifiAddr, cellAddr, port
 			ch <- raceResult{link: link, err: errNoAddr}
 			return
 		}
+		// Give preferred link a tiny head start
+		if link != preferred {
+			select {
+			case <-ctx.Done():
+				ch <- raceResult{link: link, err: ctx.Err()}
+				return
+			case <-time.After(8 * time.Millisecond):
+			}
+		}
 		start := time.Now()
 		d := NewBoundDialer(binder, link, 5*time.Second)
-		c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
-		ch <- raceResult{conn: c, link: link, rtt: time.Since(start), err: err}
+		c, dErr := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+		ch <- raceResult{conn: c, link: link, rtt: time.Since(start), err: dErr}
 	}
 
 	n := 0
-	if wifiAddr != "" {
+	if ep.WiFiAddr != "" {
 		n++
-		go dialOne(LinkWiFi, wifiAddr)
+		go dialOne(LinkWiFi, ep.WiFiAddr)
 	}
-	if cellAddr != "" {
+	if ep.CellAddr != "" {
 		n++
-		go dialOne(LinkCellular, cellAddr)
+		go dialOne(LinkCellular, ep.CellAddr)
 	}
 	if n == 0 {
-		return nil, 0, errNoAddr
+		closedCh := make(chan raceResult)
+		close(closedCh)
+		return nil, 0, closedCh, errNoAddr
 	}
 
-	// Winner takes the connection; close the loser when it arrives.
 	first := <-ch
 	if first.err == nil {
-		go func() {
-			for i := 1; i < n; i++ {
-				if r := <-ch; r.err == nil && r.conn != nil {
-					r.conn.Close()
-				}
-			}
-		}()
-		return first.conn, first.link, nil
+		// Winner! Return standby channel for the loser
+		return first.conn, first.link, ch, nil
 	}
 
-	// First failed; wait for the second.
+	// First failed, wait for second
 	if n == 1 {
-		return nil, 0, first.err
+		closedCh := make(chan raceResult)
+		close(closedCh)
+		return nil, 0, closedCh, first.err
 	}
+
 	second := <-ch
 	if second.err == nil {
-		return second.conn, second.link, nil
+		closedCh := make(chan raceResult)
+		close(closedCh)
+		return second.conn, second.link, closedCh, nil
 	}
-	return nil, 0, first.err
+
+	closedCh := make(chan raceResult)
+	close(closedCh)
+	return nil, 0, closedCh, first.err
+}
+
+// DialRace is a simpler wrapper that returns only the winner and closes the loser.
+func DialRace(ctx context.Context, binder SocketBinder, wifiAddr, cellAddr, port string) (net.Conn, LinkType, error) {
+	ep := &DualEndpoint{WiFiAddr: wifiAddr, CellAddr: cellAddr}
+	winner, link, standbyCh, err := DialSpeculativeDualLink(ctx, binder, ep, port, LinkWiFi)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Close the standby in background
+	go func() {
+		for res := range standbyCh {
+			if res.err == nil && res.conn != nil {
+				res.conn.Close()
+			}
+		}
+	}()
+	return winner, link, nil
 }
 
 var errNoAddr = errNoAddrType{}
