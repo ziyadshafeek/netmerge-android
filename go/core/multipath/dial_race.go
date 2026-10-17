@@ -223,6 +223,17 @@ func DialSpeculativeDualLink(
 	}
 
 	wifiAddr, cellAddr := ep.WaitReady(ctx)
+	// STRICT single-radio check: the resolver mirrors the working radio's IP
+	// into the dead radio's field (and the dial fallback routes it out the
+	// default network anyway), so a non-empty addr does NOT prove the radio is
+	// up. Clear addrs whose radio has no live Network ref — otherwise we'd
+	// stagger (up to 340ms) against a dead radio and poison worker counts.
+	if wifiAddr != "" && binder != nil && !binder.CanBindLink(int(LinkWiFi)) {
+		wifiAddr = ""
+	}
+	if cellAddr != "" && binder != nil && !binder.CanBindLink(int(LinkCellular)) {
+		cellAddr = ""
+	}
 	ch := make(chan raceResult, 2)
 
 	// Closed when the preferred link's dial FAILS, so a staggered non-preferred

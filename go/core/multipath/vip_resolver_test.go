@@ -164,6 +164,10 @@ func (f *fakeBinder) BindAndProtect(fd int64, networkType int) bool {
 	return !f.fail.Load()
 }
 
+func (f *fakeBinder) CanBindLink(networkType int) bool {
+	return !f.fail.Load()
+}
+
 func (f *fakeBinder) OnBytes(networkType int, rxBytes, txBytes int64) {}
 
 func TestBoundDialerUsesBinder(t *testing.T) {

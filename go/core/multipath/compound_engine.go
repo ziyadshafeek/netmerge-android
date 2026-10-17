@@ -29,14 +29,19 @@ var relayBufPool = sync.Pool{
 type byteCounterWriter struct {
 	w        io.Writer
 	binder   SocketBinder
+	sched    *Scheduler
 	link     LinkType
 	isUpload bool
 }
 
 func (bw *byteCounterWriter) Write(p []byte) (int, error) {
+	start := time.Now()
 	n, err := bw.w.Write(p)
 	if n > 0 {
 		RecordLinkBytes(bw.link, int64(n))
+		if bw.sched != nil {
+			bw.sched.RecordBytes(bw.link, int64(n), time.Since(start))
+		}
 		if bw.binder != nil {
 			if bw.isUpload {
 				bw.binder.OnBytes(int(bw.link), 0, int64(n))
@@ -97,22 +102,23 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 ) error {
 	raceCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-
-	// Preferred link from the BDP-aware multipath scheduler (deficit
-	// inverse-completion-time water-filling with active flow-ratio pinning).
-	// The returned stagger delays the non-preferred dial so a cellular-primary
-	// assignment survives 5G NR RRC wakeup instead of losing the race to Wi-Fi's
-	// shorter RTT on every flow.
 	var preferred LinkType
 	var stagger time.Duration
 	if e.MPSched != nil {
 		preferred, _, stagger = e.MPSched.SelectLinks(256 * 1024)
 	}
+	dialStart := time.Now()
 	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, preferred, stagger)
 	if err != nil {
+		if e.MPSched != nil && preferred != 0 {
+			e.MPSched.RecordFailure(preferred)
+		}
 		return err
 	}
-
+	if e.MPSched != nil {
+		e.MPSched.RecordRTT(primaryLink, time.Since(dialStart))
+		e.MPSched.RecordSuccess(primaryLink)
+	}
 	var standbyUsed atomic.Bool
 	recycleStandby := func() {
 		if !standbyUsed.CompareAndSwap(false, true) {
@@ -127,7 +133,6 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 		}()
 	}
 	defer recycleStandby()
-
 	popStandby := func() (net.Conn, LinkType) {
 		if !standbyUsed.CompareAndSwap(false, true) {
 			return nil, 0
@@ -148,8 +153,6 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 		}
 		return nil, 0
 	}
-
-	// Read full initial payload (and if a caller passed an 8-byte MultiReader, assemble the full TLS record)
 	firstPayload := make([]byte, 16384)
 	_ = clientConn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 	n, _ := initialReader.Read(firstPayload)
@@ -165,18 +168,23 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 		}
 	}
 	_ = clientConn.SetReadDeadline(time.Time{})
-
 	activeUpstream := primaryConn
 	activeLink := primaryLink
-
 	if n > 0 {
+		wStart := time.Now()
 		if _, wErr := WriteClientHello(activeUpstream, firstPayload[:n]); wErr != nil {
 			MarkLinkStalled(activeLink, 3*time.Second)
+			if e.MPSched != nil {
+				e.MPSched.RecordFailure(activeLink)
+			}
 			if sbConn, sbLink := popStandby(); sbConn != nil {
 				activeUpstream.Close()
 				activeUpstream = sbConn
 				activeLink = sbLink
 				if _, wErr2 := WriteClientHello(activeUpstream, firstPayload[:n]); wErr2 != nil {
+					if e.MPSched != nil {
+						e.MPSched.RecordFailure(activeLink)
+					}
 					activeUpstream.Close()
 					return wErr2
 				}
@@ -186,20 +194,24 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 			}
 		} else {
 			RecordLinkBytes(activeLink, int64(n))
+			if e.MPSched != nil {
+				e.MPSched.RecordBytes(activeLink, int64(n), time.Since(wStart))
+			}
 			if e.Binder != nil {
 				e.Binder.OnBytes(int(activeLink), 0, int64(n))
 			}
-
-			// Wait up to 2.0s for first response packet (ServerHello)
 			_ = activeUpstream.SetReadDeadline(time.Now().Add(2000 * time.Millisecond))
 			firstResp := make([]byte, 16384)
+			rStart := time.Now()
 			rn, rErr := activeUpstream.Read(firstResp)
 			_ = activeUpstream.SetReadDeadline(time.Time{})
-
 			if rn > 0 {
-				// Primary succeeded! Immediately recycle standby into warmPool for the next stream!
 				recycleStandby()
 				RecordLinkBytes(activeLink, int64(rn))
+				if e.MPSched != nil {
+					e.MPSched.RecordRTT(activeLink, time.Since(rStart))
+					e.MPSched.RecordBytes(activeLink, int64(rn), time.Since(rStart))
+				}
 				if e.Binder != nil {
 					e.Binder.OnBytes(int(activeLink), int64(rn), 0)
 				}
@@ -208,13 +220,18 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 					return err
 				}
 			} else if rErr != nil {
-				// Primary failed/stalled with 0 bytes received: replay full ClientHello on standby
 				MarkLinkStalled(activeLink, 3*time.Second)
+				if e.MPSched != nil {
+					e.MPSched.RecordFailure(activeLink)
+				}
 				if sbConn, sbLink := popStandby(); sbConn != nil {
 					activeUpstream.Close()
 					activeUpstream = sbConn
 					activeLink = sbLink
 					if _, err := WriteClientHello(activeUpstream, firstPayload[:n]); err != nil {
+						if e.MPSched != nil {
+							e.MPSched.RecordFailure(activeLink)
+						}
 						activeUpstream.Close()
 						return err
 					}
@@ -229,18 +246,19 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 			}
 		}
 	} else {
-		// Preconnect socket (0 initial bytes): do NOT kill on read timeout; recycle standby and proceed to relay!
 		recycleStandby()
 	}
-
 	defer activeUpstream.Close()
 	defer TrackFlow(activeLink)()
-
+	if e.MPSched != nil {
+		e.MPSched.AcquireFlow(activeLink)
+		defer e.MPSched.ReleaseFlow(activeLink)
+	}
 	errCh := make(chan error, 2)
 	go func() {
 		bufPtr := relayBufPool.Get().(*[]byte)
 		defer relayBufPool.Put(bufPtr)
-		upWriter := &byteCounterWriter{w: activeUpstream, binder: e.Binder, link: activeLink, isUpload: true}
+		upWriter := &byteCounterWriter{w: activeUpstream, binder: e.Binder, sched: e.MPSched, link: activeLink, isUpload: true}
 		_, err := io.CopyBuffer(upWriter, initialReader, *bufPtr)
 		if cw, ok := activeUpstream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
@@ -250,7 +268,7 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 	go func() {
 		bufPtr := relayBufPool.Get().(*[]byte)
 		defer relayBufPool.Put(bufPtr)
-		downWriter := &byteCounterWriter{w: clientConn, binder: e.Binder, link: activeLink, isUpload: false}
+		downWriter := &byteCounterWriter{w: clientConn, binder: e.Binder, sched: e.MPSched, link: activeLink, isUpload: false}
 		_, err := io.CopyBuffer(downWriter, activeUpstream, *bufPtr)
 		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
@@ -314,14 +332,14 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	ep *DualEndpoint,
 	port string,
 ) error {
+	SanitizePrivacyHeaders(req.Header)
 	wifiAddr, cellAddr := ep.WaitReady(ctx)
-	if wifiAddr == "" || cellAddr == "" {
+	if wifiAddr == "" && cellAddr == "" {
 		return e.passThroughHTTP(ctx, clientConn, req, ep, port)
 	}
-
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	probeConn, _, standbyCh, err := DialSpeculativeDualLink(probeCtx, e.Binder, ep, port, 0, 0)
+	probeConn, probeLink, standbyCh, err := DialSpeculativeDualLink(probeCtx, e.Binder, ep, port, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -332,7 +350,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 			}
 		}
 	}()
-
 	clientRange := req.Header.Get("Range")
 	var reqStart, reqEnd, totalSize int64
 	hasExplicitEnd := false
@@ -346,8 +363,8 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 			}
 		}
 	}
-
 	probeReq := req.Clone(probeCtx)
+	SanitizePrivacyHeaders(probeReq.Header)
 	if clientRange == "" {
 		probeReq.Header.Set("Range", "bytes=0-0")
 	} else {
@@ -366,7 +383,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	_, _ = io.CopyN(io.Discard, probeResp.Body, 1)
 	probeResp.Body.Close()
 	probeConn.Close()
-
 	cr := probeResp.Header.Get("Content-Range")
 	if probeResp.StatusCode != http.StatusPartialContent || !strings.HasPrefix(cr, "bytes ") {
 		return e.passThroughHTTP(ctx, clientConn, req, ep, port)
@@ -386,7 +402,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	if span < MinCompoundSize {
 		return e.passThroughHTTP(ctx, clientConn, req, ep, port)
 	}
-
 	statusLine := "HTTP/1.1 200 OK\r\n"
 	if clientRange != "" {
 		statusLine = "HTTP/1.1 206 Partial Content\r\n"
@@ -396,7 +411,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	}
 	probeResp.Header.Set("Content-Length", strconv.FormatInt(span, 10))
 	probeResp.Header.Del("Transfer-Encoding")
-
 	var hdrBuf bytes.Buffer
 	hdrBuf.WriteString(statusLine)
 	_ = probeResp.Header.Write(&hdrBuf)
@@ -404,11 +418,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	if _, err := clientConn.Write(hdrBuf.Bytes()); err != nil {
 		return err
 	}
-
-	// Dynamic segment sizing (Case B): 512KB x2 for fast time-to-first-byte,
-	// then 2MB (4MB for files >= 100MB). A 5GB file needs ~1,280 requests
-	// instead of 20,480, so CDNs don't rate-limit and TCP cwnd stays at full
-	// 5G/Wi-Fi BDP instead of stalling every 256KB on a request/response RTT.
 	segOffsets := []int64{reqStart}
 	for off := reqStart; off <= reqEnd; {
 		sz := selectSegmentSize(span, int64(len(segOffsets)-1))
@@ -430,21 +439,17 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	for i := range results {
 		results[i] = make(chan segResult, 1)
 	}
-
 	sctx, scancel := context.WithCancel(ctx)
 	defer scancel()
-
 	var nextSeg atomic.Int32
 	var flushIdx atomic.Int32
 	retryCh := make(chan int, numSegs)
-	// segAttempts is shared across both workers: a segment aborts the stream
-	// only after 4 failed attempts (both links tried twice), instead of one
-	// worker's local counter stranding the flush loop during a handover.
-	var segAttempts []atomic.Int32
-	segAttempts = make([]atomic.Int32, numSegs)
-
-	worker := func(link LinkType, ip, fallbackIP string) {
-		defer TrackFlow(link)()
+	segAttempts := make([]atomic.Int32, numSegs)
+	worker := func(initialLink LinkType, initialIP, initialFallback string) {
+		curLink := initialLink
+		curIP := initialIP
+		curFallback := initialFallback
+		defer TrackFlow(curLink)()
 		var conn net.Conn
 		var connBr *bufio.Reader
 		defer func() {
@@ -452,46 +457,42 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 				conn.Close()
 			}
 		}()
-
-		fetchSeg := func(idx int) ([]byte, error) {
+		fetchSeg := func(idx int) ([]byte, bool, error) {
 			sStart := segOffsets[idx]
 			sEnd := segOffsets[idx+1] - 1
 			expected := int(sEnd - sStart + 1)
-
 			if conn == nil {
-				c, dErr := e.dialSplicerLink(sctx, link, ip, fallbackIP, port)
+				c, dErr := e.dialSplicerLink(sctx, curLink, curIP, curFallback, port)
 				if dErr != nil {
-					return nil, dErr
+					// Dial failed (e.g. this radio just dropped): signal dialFail=true
+					// so we can seamlessly fail the worker over to the live radio!
+					return nil, true, dErr
 				}
 				conn = c
 				connBr = bufio.NewReaderSize(conn, 128*1024)
 			}
-
 			rClone := req.Clone(sctx)
+			SanitizePrivacyHeaders(rClone.Header)
 			rClone.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", sStart, sEnd))
 			rClone.Header.Set("Connection", "keep-alive")
-			// Sliding activity watchdog: the segment (request + headers + body)
-			// is only aborted after segStallTimeout with ZERO progress, instead
-			// of a rigid wall-clock budget that kills segments during 5G
-			// tower handovers. The deadline is extended on every chunk read.
 			const segStallTimeout = 12 * time.Second
 			_ = conn.SetDeadline(time.Now().Add(segStallTimeout))
 			if err := rClone.Write(conn); err != nil {
 				conn.Close()
 				conn = nil
-				return nil, err
+				return nil, false, err
 			}
 			resp, err := http.ReadResponse(connBr, rClone)
 			if err != nil {
 				conn.Close()
 				conn = nil
-				return nil, err
+				return nil, false, err
 			}
 			if resp.StatusCode != http.StatusPartialContent {
 				resp.Body.Close()
 				conn.Close()
 				conn = nil
-				return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+				return nil, false, fmt.Errorf("unexpected status %d", resp.StatusCode)
 			}
 			buf := make([]byte, expected)
 			readBytes := 0
@@ -500,9 +501,9 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 				if n > 0 {
 					readBytes += n
 					_ = conn.SetDeadline(time.Now().Add(segStallTimeout))
-					RecordLinkBytes(link, int64(n))
+					RecordLinkBytes(curLink, int64(n))
 					if e.Binder != nil {
-						e.Binder.OnBytes(int(link), int64(n), 0)
+						e.Binder.OnBytes(int(curLink), int64(n), 0)
 					}
 				}
 				if rErr != nil {
@@ -512,16 +513,14 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 					if rErr == io.EOF && readBytes == expected {
 						break
 					}
-					return nil, rErr
+					return nil, false, rErr
 				}
 			}
 			resp.Body.Close()
 			_ = conn.SetDeadline(time.Time{})
-			return buf, nil
+			return buf, false, nil
 		}
-
 		for {
-			// Bound lookahead window to 10 segments (2.5 MB max RAM)
 			for nextSeg.Load()-flushIdx.Load() > 10 {
 				select {
 				case <-sctx.Done():
@@ -529,7 +528,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 				case <-time.After(10 * time.Millisecond):
 				}
 			}
-
 			var idx int
 			select {
 			case idx = <-retryCh:
@@ -548,22 +546,25 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 					}
 				}
 			}
-
-			data, err := fetchSeg(idx)
+			data, dialFailed, err := fetchSeg(idx)
 			if err != nil {
-				// Brief backoff so a momentary stall doesn't instantly burn attempts.
+				// If the radio itself could not bind/connect (single-radio mode or Wi-Fi dropped),
+				// pivot this worker to the other radio instead of poisoning segAttempts!
+				if dialFailed {
+					if curLink == LinkWiFi && cellAddr != "" {
+						curLink, curIP, curFallback = LinkCellular, cellAddr, wifiAddr
+					} else if curLink == LinkCellular && wifiAddr != "" {
+						curLink, curIP, curFallback = LinkWiFi, wifiAddr, cellAddr
+					}
+				}
 				select {
 				case <-sctx.Done():
 					return
-				case <-time.After(150 * time.Millisecond):
+				case <-time.After(100 * time.Millisecond):
 				}
-				// Retry once more; if still failing, hand off to retryCh so the other link steals it!
-				data, err = fetchSeg(idx)
+				data, _, err = fetchSeg(idx)
 				if err != nil {
-					if segAttempts[idx].Add(2) >= 4 {
-						// Both links have now failed this segment twice:
-						// abort the stream instead of stranding the flush
-						// loop (which would hang until ctx timeout).
+					if segAttempts[idx].Add(1) >= 4 {
 						results[idx] <- segResult{err: err}
 						return
 					}
@@ -579,16 +580,27 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 			results[idx] <- segResult{data: data}
 		}
 	}
-
-	// Hard-pinned per-radio workers (Case C): 2x Wi-Fi + 2x Cellular, all
-	// pulling from the same shared segment queue. Neither radio can ever sit
-	// idle, and the second worker per link hides the HTTP request/response
-	// RTT gap. The faster radio naturally drains more segments.
-	go worker(LinkWiFi, wifiAddr, cellAddr)
-	go worker(LinkCellular, cellAddr, wifiAddr)
-	go worker(LinkWiFi, wifiAddr, cellAddr)
-	go worker(LinkCellular, cellAddr, wifiAddr)
-
+	// Launch workers across available links. If one link is offline at start,
+	// worker() automatically pivots onto the live radio on its first dial.
+	if wifiAddr != "" && cellAddr != "" {
+		go worker(LinkWiFi, wifiAddr, cellAddr)
+		go worker(LinkCellular, cellAddr, wifiAddr)
+		go worker(LinkWiFi, wifiAddr, cellAddr)
+		go worker(LinkCellular, cellAddr, wifiAddr)
+	} else {
+		// Single-radio resolved: launch 3 pipelined workers on the active link
+		// to keep the 4G/5G or Wi-Fi BDP pipe 100% full across segment boundaries.
+		activeIP := wifiAddr
+		if activeIP == "" {
+			activeIP = cellAddr
+		}
+		if probeLink == 0 {
+			probeLink = LinkCellular
+		}
+		for w := 0; w < 3; w++ {
+			go worker(probeLink, activeIP, activeIP)
+		}
+	}
 	for i := 0; i < numSegs; i++ {
 		select {
 		case res := <-results[i]:

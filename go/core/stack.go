@@ -396,6 +396,22 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	}
 	e.udpMu.Unlock()
 
+	// Zero-leak local DNS interception: handle UDP/53 directly via mpEngine.DNS
+	// (sharded DoH) without opening any upstream plaintext UDP/53 socket.
+	// Skipping dialBoundUDP also means a dial failure during a radio handover
+	// can no longer drop the query before the interceptor answers it.
+	if dstPort == 53 && e.mpEngine != nil {
+		var wq waiter.Queue
+		ep, terr := r.CreateEndpoint(&wq)
+		if terr != nil {
+			return false
+		}
+		tunConn := gonet.NewUDPConn(&wq, ep)
+		clientAddr := &net.UDPAddr{IP: tcpipToIP(id.RemoteAddress), Port: int(id.RemotePort)}
+		go e.serveInterceptedDNS(tunConn, clientAddr)
+		return true
+	}
+
 	// Pick the network BEFORE dialing: DNS needs the slot's DNS server.
 	sl := e.scheduler.AcquireFor(f, nil)
 	if sl == nil {
@@ -455,6 +471,32 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	clientAddr := &net.UDPAddr{IP: tcpipToIP(id.RemoteAddress), Port: int(id.RemotePort)}
 	go e.relayUDP(us, clientAddr)
 	return true
+}
+
+// serveInterceptedDNS answers DNS queries for one 5-tuple directly from the
+// sharded-DoH interceptor, with no upstream socket at all. Each query runs in
+// its own goroutine so a slow DoH lookup never head-of-line-blocks others;
+// the session ends after 10s without queries.
+func (e *Engine) serveInterceptedDNS(tunConn net.PacketConn, clientAddr *net.UDPAddr) {
+	defer func() { _ = recover() }()
+	defer tunConn.Close()
+	bufPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufPtr)
+	buf := *bufPtr
+	for {
+		_ = tunConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		n, _, err := tunConn.ReadFrom(buf[:cap(buf)])
+		if err != nil {
+			return
+		}
+		q := append([]byte(nil), buf[:n]...)
+		go func(query []byte) {
+			defer func() { _ = recover() }()
+			if resp := e.mpEngine.DNS.HandleQuery(query); resp != nil {
+				_, _ = tunConn.WriteTo(resp, clientAddr)
+			}
+		}(q)
+	}
 }
 
 // relayUDP shuttles datagrams between the TUN side and the upstream socket

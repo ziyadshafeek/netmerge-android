@@ -1,6 +1,7 @@
 package core
 
 import "netmerge/core/multipath"
+import "syscall"
 
 // engineRef is the global Engine reference for the protectorBinder's OnBytes
 // callback. Set by newMultipathEngine.
@@ -24,6 +25,21 @@ func (b *protectorBinder) BindAndProtect(fd int64, networkType int) bool {
 	// protected so there is no routing loop.
 	b.p.Protect(int(fd))
 	return true
+}
+
+// CanBindLink is the STRICT link-liveness probe: it calls the Kotlin
+// bindAndProtect WITHOUT the Protect fallback, so a dead radio (null
+// Network ref) reports false. Used for single- vs dual-radio decisions.
+func (b *protectorBinder) CanBindLink(networkType int) bool {
+	if b.p == nil {
+		return false
+	}
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return true // cannot probe; assume the radio is up
+	}
+	defer syscall.Close(fd)
+	return b.p.BindAndProtect(int(fd), networkType)
 }
 
 // OnBytes wires VIP flow byte counters back to the Scheduler slots so the

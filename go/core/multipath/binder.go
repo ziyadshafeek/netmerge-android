@@ -35,6 +35,11 @@ const (
 // and reports real-time per-link byte telemetry.
 type SocketBinder interface {
 	BindAndProtect(fd int64, networkType int) bool
+	// CanBindLink is the STRICT link-liveness probe: it reports whether the
+	// radio currently has a live Network ref, WITHOUT the Protect-fallback
+	// that BindAndProtect applies for cold-start null windows. Used to decide
+	// single- vs dual-radio behavior (stagger, worker counts).
+	CanBindLink(networkType int) bool
 	OnBytes(networkType int, rxBytes int64, txBytes int64)
 }
 

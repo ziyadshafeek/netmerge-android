@@ -387,6 +387,7 @@ func (hs *HalvingSplicer) streamSegment(
 	for k, v := range origReq.Header {
 		req.Header[k] = v
 	}
+	SanitizePrivacyHeaders(req.Header)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", absStart, absEnd))
 	if etag != "" {
 		req.Header.Set("If-Range", etag)

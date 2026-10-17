@@ -16,19 +16,16 @@ import (
 )
 
 const (
-	// 198.18.0.1 (RFC 2544 benchmark range) allocated as a ring of 8 VIPs per domain.
 	firstVIP      uint32 = 0xC6120001
 	vipsPerDomain int    = 8
 )
 
 var (
-	// Discovered 96-bit carrier NAT64 prefix (defaults to RFC 6052 well-known 64:ff9b::/96).
 	nat64PrefixMu sync.RWMutex
 	nat64Prefix   = [12]byte{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0}
 	nat64Probed   atomic.Bool
 )
 
-// SynthesizeCarrierNAT64 converts an IPv4 address into a carrier NAT64 IPv6 address.
 func SynthesizeCarrierNAT64(ip4 net.IP) string {
 	v4 := ip4.To4()
 	if v4 == nil {
@@ -101,13 +98,11 @@ type VIPResolver struct {
 	nextVIP  atomic.Uint32
 
 	binder     SocketBinder
-	dohClients map[string]*http.Client // DoH endpoint URL -> persistent bound HTTP/2 client
-	dohNext    atomic.Uint64           // round-robin sharding across DoH authorities
+	dohClients map[string]*http.Client // Keyed by "link|url" so Cellular never overwrites Wi-Fi!
+	dohNext    atomic.Uint64
 	resolve    func(ctx context.Context, domain string) (string, string)
 }
 
-// Zero-log DoH authorities for query sharding: no single provider sees the
-// full browsing graph. Round-robin per query across independent operators.
 type dohProvider struct {
 	url string
 	sni string
@@ -117,12 +112,21 @@ var dohProvidersWiFi = []dohProvider{
 	{url: "https://1.1.1.1/dns-query", sni: "cloudflare-dns.com"},
 	{url: "https://9.9.9.9/dns-query", sni: "dns.quad9.net"},
 	{url: "https://1.0.0.1/dns-query", sni: "cloudflare-dns.com"},
+	{url: "https://8.8.8.8/dns-query", sni: "dns.google"},
 }
 
 var dohProvidersCell = []dohProvider{
 	{url: "https://[2606:4700:4700::1111]/dns-query", sni: "cloudflare-dns.com"},
 	{url: "https://[2620:fe::fe]/dns-query", sni: "dns.quad9.net"},
 	{url: "https://1.1.1.1/dns-query", sni: "cloudflare-dns.com"},
+	{url: "https://9.9.9.9/dns-query", sni: "dns.quad9.net"},
+}
+
+func dohClientKey(link LinkType, url string) string {
+	if link == LinkCellular {
+		return "cell|" + url
+	}
+	return "wifi|" + url
 }
 
 func NewVIPResolver(binder SocketBinder) *VIPResolver {
@@ -132,21 +136,16 @@ func NewVIPResolver(binder SocketBinder) *VIPResolver {
 		binder:     binder,
 		dohClients: make(map[string]*http.Client),
 	}
-	// One persistent HTTP/2 TLS 1.3 client per (radio, authority) so DNS
-	// queries never leak file descriptors and each uses the correct SNI.
 	for _, p := range dohProvidersWiFi {
-		r.dohClients[p.url] = newBoundDoHClient(binder, LinkWiFi, p.sni)
+		r.dohClients[dohClientKey(LinkWiFi, p.url)] = newBoundDoHClient(binder, LinkWiFi, p.sni)
 	}
 	for _, p := range dohProvidersCell {
-		r.dohClients[p.url] = newBoundDoHClient(binder, LinkCellular, p.sni)
+		r.dohClients[dohClientKey(LinkCellular, p.url)] = newBoundDoHClient(binder, LinkCellular, p.sni)
 	}
 	r.nextVIP.Store(firstVIP)
 	return r
 }
 
-// newBoundDoHClient creates a persistent HTTP/2 TLS 1.3 client strictly bound
-// to a single physical radio with the authority's SNI so DNS queries never
-// leak file descriptors and TLS authenticates the right hostname.
 func newBoundDoHClient(binder SocketBinder, link LinkType, sni string) *http.Client {
 	dialer := NewBoundDialer(binder, link, 1200*time.Millisecond)
 	tr := &http.Transport{
@@ -297,7 +296,10 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	}
 	ch := make(chan res, 2)
 
-	// Wi-Fi resolution: prefers IPv4 (A) then IPv6 (AAAA).
+	// Cross-Radio Oblivious Sharding: Wi-Fi and Cellular resolve concurrently
+	// over distinct zero-log DoH authorities; if one radio is offline (e.g. BSNL
+	// cellular only), its bind fails fast (<1ms) and applyEndpointAddrs mirrors
+	// the working radio's IP.
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkWiFi, false)
 		addr := ""
@@ -313,8 +315,6 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		ch <- res{link: LinkWiFi, addr: addr}
 	}()
 
-	// Cellular resolution: prefers native IPv6 (AAAA) first; retains raw IPv4 fallback
-	// so dual-stack or CLAT 5G bearers can try both native IPv6/NAT64 and IPv4 seamlessly.
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkCellular, true)
 		addr := ""
@@ -342,7 +342,7 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		cRawV4 = first.rawV4
 	}
 
-	graceTimer := time.NewTimer(75 * time.Millisecond)
+	graceTimer := time.NewTimer(50 * time.Millisecond)
 	select {
 	case second := <-ch:
 		graceTimer.Stop()
@@ -402,9 +402,9 @@ func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string) 
 }
 
 func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link LinkType, preferV6 bool) []net.IP {
-	qtypes := []uint16{1, 28} // A, AAAA
+	qtypes := []uint16{1, 28}
 	if preferV6 {
-		qtypes = []uint16{28, 1} // AAAA first on 5G
+		qtypes = []uint16{28, 1}
 	}
 
 	type dnsOut struct {
@@ -413,44 +413,49 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 	}
 	outCh := make(chan dnsOut, 2)
 
-	// 1. ZERO-LEAK ENCRYPTED DoH FIRST: race A and AAAA strictly over encrypted
-	// DoH, sharded across independent authorities. Plaintext UDP port 53 is
-	// NEVER transmitted during normal operation - the ISP sees zero DNS.
 	for idx, qt := range qtypes {
 		go func(qtype uint16, prio int) {
 			if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
 				outCh <- dnsOut{ips: ips, priority: prio}
+			} else {
+				outCh <- dnsOut{ips: nil, priority: prio}
 			}
 		}(qt, idx+1)
 	}
 
-	dohTimer := time.NewTimer(650 * time.Millisecond)
+	dohTimer := time.NewTimer(1100 * time.Millisecond)
 	defer dohTimer.Stop()
 
 	var fallback []net.IP
 	for i := 0; i < 2; i++ {
 		select {
 		case res := <-outCh:
-			if res.priority == 1 {
-				return res.ips
-			}
-			if len(fallback) == 0 {
-				fallback = res.ips
+			if len(res.ips) > 0 {
+				if res.priority == 1 {
+					return res.ips
+				}
+				if len(fallback) == 0 {
+					fallback = res.ips
+				}
 			}
 		case <-dohTimer.C:
 			if len(fallback) > 0 {
 				return fallback
 			}
-			// Only if encrypted DoH is completely unreachable, try emergency plaintext fallback.
-			return r.queryUDPOnLink(ctx, domain, qtypes[0], link)
+			// Cross-link DoH rescue before ever touching UDP/53:
+			otherLink := LinkCellular
+			if link == LinkCellular {
+				otherLink = LinkWiFi
+			}
+			if ips := r.queryDoHOnLink(ctx, domain, qtypes[0], otherLink); len(ips) > 0 {
+				return ips
+			}
+			return nil
 		case <-ctx.Done():
 			return fallback
 		}
 	}
-	if len(fallback) > 0 {
-		return fallback
-	}
-	return r.queryUDPOnLink(ctx, domain, qtypes[0], link)
+	return fallback
 }
 
 func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {
@@ -465,13 +470,11 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 	if len(providers) == 0 {
 		return nil
 	}
-	// Round-robin sharding: consecutive queries spread across independent
-	// zero-log authorities so no single provider sees the full query graph.
 	start := int(r.dohNext.Add(1) % uint64(len(providers)))
 
 	for attempt := 0; attempt < len(providers); attempt++ {
 		p := providers[(start+attempt)%len(providers)]
-		client := r.dohClients[p.url]
+		client := r.dohClients[dohClientKey(link, p.url)]
 		if client == nil {
 			continue
 		}
@@ -484,7 +487,7 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 
 		resp, err := client.Do(req)
 		if err != nil {
-			continue // try next authority (e.g. IPv6 DoH unreachable on CLAT carriers)
+			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		status := resp.StatusCode
@@ -495,42 +498,15 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		if ips := parseDNSResponsePacket(body, txID); len(ips) > 0 {
 			return ips
 		}
-		// Empty answer: try next authority rather than failing over to plaintext.
 	}
 	return nil
 }
 
 func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {
-	wireReq, txID := buildDNSQueryPacket(domain, qtype, false)
-	if len(wireReq) == 0 {
-		return nil
-	}
-	servers := []string{"1.1.1.1:53", "8.8.8.8:53"}
-	if link == LinkCellular {
-		servers = []string{"[2606:4700:4700::1111]:53", "1.1.1.1:53", "[2001:4860:4860::8888]:53"}
-	}
-
-	dialer := NewBoundDialer(r.binder, link, 550*time.Millisecond)
-	for _, srv := range servers {
-		conn, err := dialer.DialContext(ctx, "udp", srv)
-		if err != nil {
-			continue
-		}
-		_ = conn.SetDeadline(time.Now().Add(450 * time.Millisecond))
-		_, err = conn.Write(wireReq)
-		if err != nil {
-			_ = conn.Close()
-			continue
-		}
-		buf := make([]byte, 2048)
-		n, err := conn.Read(buf)
-		_ = conn.Close()
-		if err != nil || n < 12 {
-			continue
-		}
-		if ips := parseDNSResponsePacket(buf[:n], txID); len(ips) > 0 {
-			return ips
-		}
+	// Zero-plaintext policy: legacy callers (e.g. the RRC keep-awake pacer)
+	// are routed through encrypted DoH so UDP/53 is never leaked.
+	if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
+		return ips
 	}
 	return nil
 }
@@ -543,10 +519,10 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 	var buf bytes.Buffer
 	var hdr [12]byte
 	binary.BigEndian.PutUint16(hdr[0:2], txID)
-	binary.BigEndian.PutUint16(hdr[2:4], 0x0100) // Standard query, RD=1
-	binary.BigEndian.PutUint16(hdr[4:6], 1)      // QDCOUNT=1
+	binary.BigEndian.PutUint16(hdr[2:4], 0x0100)
+	binary.BigEndian.PutUint16(hdr[4:6], 1)
 	if padEDNS {
-		binary.BigEndian.PutUint16(hdr[10:12], 1) // ARCOUNT=1 (EDNS0 OPT)
+		binary.BigEndian.PutUint16(hdr[10:12], 1)
 	}
 	buf.Write(hdr[:])
 
@@ -562,7 +538,7 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 
 	var qtail [4]byte
 	binary.BigEndian.PutUint16(qtail[0:2], qtype)
-	binary.BigEndian.PutUint16(qtail[2:4], 1) // QCLASS=IN
+	binary.BigEndian.PutUint16(qtail[2:4], 1)
 	buf.Write(qtail[:])
 
 	if padEDNS {
@@ -580,7 +556,11 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 		binary.BigEndian.PutUint16(padOpt[2:4], uint16(padLen))
 		buf.Write(padOpt[:])
 		if padLen > 0 {
-			buf.Write(make([]byte, padLen))
+			// Fill EDNS0 padding with cryptographic pseudorandom bytes instead
+			// of 0x00 so TLS compression/entropy side-channels learn nothing.
+			noise := make([]byte, padLen)
+			GlobalPrivacy.FillCryptoRandom(noise)
+			buf.Write(noise)
 		}
 	}
 
