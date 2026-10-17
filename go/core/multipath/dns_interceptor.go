@@ -115,7 +115,7 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 	resp = append(resp, 0xC0, 0x0C)       // Pointer to QNAME
 	resp = append(resp, 0x00, 0x01)       // TYPE = A
 	resp = append(resp, 0x00, 0x01)       // CLASS = IN
-	resp = append(resp, 0x00, 0x00, 0x00, 0x3C) // TTL = 60
+	resp = append(resp, 0x00, 0x00, 0x00, 0x05) // TTL = 5 (frequent re-query for VIP rotation)
 	resp = append(resp, 0x00, 0x04)       // RDLENGTH = 4
 	resp = append(resp, vip.To4()...)    // RDATA = VIP
 

@@ -30,10 +30,16 @@ type DualEndpoint struct {
 // per-link endpoints behind them. The app is told the VIP (so HTTP/2
 // connection coalescing can't merge subdomains onto one socket), while the
 // data plane dials the real per-link addresses. Safe for concurrent use.
+// vipRingSize is the max number of alias VIPs per domain. Rotating VIPs
+// across DNS queries prevents Chrome/Cronet from coalescing separate
+// sub-resources onto a single TCP socket, multiplying parallel streams.
+const vipRingSize = 4
+
 type VIPResolver struct {
 	mu       sync.RWMutex
 	vipToDom map[uint32]*DualEndpoint
-	domToVIP map[string]uint32
+	domToVIP map[string][]uint32 // ring of alias VIPs per domain
+	domRR    map[string]uint64   // round-robin cursor per domain
 	nextVIP  atomic.Uint32
 
 	binder SocketBinder
@@ -47,7 +53,8 @@ type VIPResolver struct {
 func NewVIPResolver(binder SocketBinder) *VIPResolver {
 	r := &VIPResolver{
 		vipToDom: make(map[uint32]*DualEndpoint),
-		domToVIP: make(map[string]uint32),
+		domToVIP: make(map[string][]uint32),
+		domRR:    make(map[string]uint64),
 		binder:   binder,
 	}
 	r.nextVIP.Store(firstVIP)
@@ -57,16 +64,29 @@ func NewVIPResolver(binder SocketBinder) *VIPResolver {
 // GetOrAllocateVIP returns the synthetic VIP for domain, allocating and
 // resolving it on first use. DNS resolution runs concurrently per link; a
 // failed lookup still allocates (with empty addresses) so the caller never
-// blocks on DNS. Concurrent calls for the same domain return the same VIP.
+// blocks on DNS. Concurrent calls for the same domain rotate through a ring
+// of up to 4 alias VIPs (all pointing at the same DualEndpoint), defeating
+// HTTP/2 connection coalescing. Zero added DNS latency after first resolve.
 func (r *VIPResolver) GetOrAllocateVIP(ctx context.Context, domain string) (net.IP, *DualEndpoint) {
-	// Fast path: already allocated.
-	r.mu.RLock()
-	if v, ok := r.domToVIP[domain]; ok {
-		ep := r.vipToDom[v]
-		r.mu.RUnlock()
+	// Fast path: already allocated — rotate through the VIP ring.
+	r.mu.Lock()
+	if vips, ok := r.domToVIP[domain]; ok && len(vips) > 0 {
+		ep := r.vipToDom[vips[0]]
+		// Grow the ring up to vipRingSize with alias VIPs on the same endpoint.
+		if len(vips) < vipRingSize && ep != nil {
+			v := r.nextVIP.Add(1)
+			r.vipToDom[v] = ep
+			vips = append(vips, v)
+			r.domToVIP[domain] = vips
+		}
+		rr := r.domRR[domain]
+		r.domRR[domain] = rr + 1
+		v := vips[rr%uint64(len(vips))]
+		ep = r.vipToDom[v]
+		r.mu.Unlock()
 		return vipFromInt(v), ep
 	}
-	r.mu.RUnlock()
+	r.mu.Unlock()
 
 	wifiAddr, cellAddr := r.resolveAddrs(ctx, domain)
 
@@ -85,7 +105,10 @@ func (r *VIPResolver) GetOrAllocateVIP(ctx context.Context, domain string) (net.
 	// Slow path: allocate under the write lock, re-checking for a lost race.
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if v, ok := r.domToVIP[domain]; ok {
+	if vips, ok := r.domToVIP[domain]; ok && len(vips) > 0 {
+		rr := r.domRR[domain]
+		r.domRR[domain] = rr + 1
+		v := vips[rr%uint64(len(vips))]
 		return vipFromInt(v), r.vipToDom[v]
 	}
 	v := r.nextVIP.Add(1)
@@ -95,7 +118,8 @@ func (r *VIPResolver) GetOrAllocateVIP(ctx context.Context, domain string) (net.
 		CellAddr: cellAddr,
 		Updated:  time.Now(),
 	}
-	r.domToVIP[domain] = v
+	r.domToVIP[domain] = []uint32{v}
+	r.domRR[domain] = 1 // next query rotates to alias VIP #2 (allocated above)
 	r.vipToDom[v] = ep
 	return vipFromInt(v), ep
 }

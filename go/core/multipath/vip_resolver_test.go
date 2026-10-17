@@ -48,8 +48,13 @@ func TestSameDomainSameVIP(t *testing.T) {
 	ip1, ep1 := r.GetOrAllocateVIP(context.Background(), "example.com")
 	ip2, ep2 := r.GetOrAllocateVIP(context.Background(), "example.com")
 
-	if !ip1.Equal(ip2) {
-		t.Fatalf("same domain got different VIPs: %v vs %v", ip1, ip2)
+	// VIP ring: consecutive queries rotate through alias VIPs (all in
+	// 198.18.0.0/15) pointing at the SAME DualEndpoint.
+	if !inBenchmarkNet(ip1) || !inBenchmarkNet(ip2) {
+		t.Fatalf("VIPs outside 198.18.0.0/15: %v %v", ip1, ip2)
+	}
+	if ep1 != ep2 {
+		t.Fatalf("same domain got different endpoints: %+v vs %+v", ep1, ep2)
 	}
 	if ep1.Domain != "example.com" || ep2.Domain != "example.com" {
 		t.Fatalf("endpoint domain wrong: %+v %+v", ep1, ep2)
@@ -59,6 +64,15 @@ func TestSameDomainSameVIP(t *testing.T) {
 	}
 	if ep1.Updated.IsZero() {
 		t.Fatal("endpoint Updated not set")
+	}
+	// After 4 queries the ring should have 4 distinct alias VIPs.
+	seen := map[string]bool{ip1.String(): true, ip2.String(): true}
+	for i := 0; i < 6; i++ {
+		ip, _ := r.GetOrAllocateVIP(context.Background(), "example.com")
+		seen[ip.String()] = true
+	}
+	if len(seen) != 4 {
+		t.Fatalf("expected 4 alias VIPs in ring, got %d: %v", len(seen), seen)
 	}
 }
 

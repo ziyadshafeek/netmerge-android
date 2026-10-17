@@ -29,6 +29,25 @@ func ConfigureGVisorTCP(s *stack.Stack) {
 	ccOpt := tcpip.CongestionControlOption("cubic")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 
+	// RACK loss detection: faster recovery on wireless links than classic RTO.
+	rackOpt := tcpip.TCPRecovery(tcpip.TCPRACKLossDetection)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rackOpt)
+
+	// 4 MB auto-tuned send/receive windows so high-RTT cellular + Wi-Fi
+	// BDP is never window-limited on the TUN side.
+	recvOpt := tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     4096,
+		Default: 256 * 1024,
+		Max:     4 * 1024 * 1024,
+	}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &recvOpt)
+	sendOpt := tcpip.TCPSendBufferSizeRangeOption{
+		Min:     4096,
+		Default: 256 * 1024,
+		Max:     4 * 1024 * 1024,
+	}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sendOpt)
+
 	ttlOpt := tcpip.DefaultTTLOption(64)
 	_ = s.SetNetworkProtocolOption(ipv4.ProtocolNumber, &ttlOpt)
 	_ = s.SetNetworkProtocolOption(ipv6.ProtocolNumber, &ttlOpt)

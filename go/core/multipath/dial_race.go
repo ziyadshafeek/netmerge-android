@@ -9,38 +9,109 @@ import (
 	"time"
 )
 
-// activeFlows tracks in-flight VIP connections per link for striping.
-// When Chrome opens N parallel TCP streams, we alternate the preferred
-// link so both Wi-Fi and Cellular carry traffic (not just the lower-ping
-// link winning 100% of races).
-var activeFlows [3]atomic.Int64 // indexed by LinkType (1=WiFi, 2=Cellular)
+var (
+	activeFlows    [3]atomic.Int64 // live TCP streams per link (1=WiFi, 2=Cellular)
+	ewmaGoodput    [3]atomic.Int64 // bytes/sec EWMA per link
+	ewmaRTTMicros  [3]atomic.Int64 // RTT in microseconds per link
+	stalledUntil   [3]atomic.Int64 // unix nano cooldown when a link stalls
+	rrCounter      atomic.Uint64
+)
 
-// toNAT64 converts an IPv4 address to its RFC 6052 NAT64 form
-// (64:ff9b::/96) for use on IPv6-only links (e.g. Jio).
+// RecordLinkRTT updates the EWMA RTT for a link.
+func RecordLinkRTT(link LinkType, rtt time.Duration) {
+	if link != LinkWiFi && link != LinkCellular {
+		return
+	}
+	us := rtt.Microseconds()
+	if us <= 0 {
+		us = 1000
+	}
+	old := ewmaRTTMicros[link].Load()
+	if old == 0 {
+		ewmaRTTMicros[link].Store(us)
+	} else {
+		ewmaRTTMicros[link].Store((old*3 + us) / 4)
+	}
+}
+
+// RecordLinkGoodput updates the EWMA throughput (bytes/sec) for a link.
+func RecordLinkGoodput(link LinkType, bytes int64, elapsed time.Duration) {
+	if (link != LinkWiFi && link != LinkCellular) || bytes < 16*1024 || elapsed <= 0 {
+		return
+	}
+	bps := int64(float64(bytes) / elapsed.Seconds())
+	old := ewmaGoodput[link].Load()
+	if old == 0 {
+		ewmaGoodput[link].Store(bps)
+	} else {
+		// Fast attack (50/50) when throughput rises, slower decay (80/20)
+		if bps > old {
+			ewmaGoodput[link].Store((old + bps) / 2)
+		} else {
+			ewmaGoodput[link].Store((old*4 + bps) / 5)
+		}
+	}
+}
+
+// MarkLinkStalled temporarily penalizes a link that failed or timed out mid-handshake.
+func MarkLinkStalled(link LinkType, d time.Duration) {
+	if link == LinkWiFi || link == LinkCellular {
+		stalledUntil[link].Store(time.Now().Add(d).UnixNano())
+	}
+}
+
+// StripedPreferredLink selects the link that maximizes per-flow throughput:
+// Score(link) = Goodput(link) / (ActiveFlows(link) + 1).
+// During cold start (before both links have measured goodput), it alternates
+// based on fewest active flows so both links are immediately probed and utilized.
+func StripedPreferredLink() LinkType {
+	now := time.Now().UnixNano()
+	wifiStalled := now < stalledUntil[LinkWiFi].Load()
+	cellStalled := now < stalledUntil[LinkCellular].Load()
+	if wifiStalled && !cellStalled {
+		return LinkCellular
+	}
+	if cellStalled && !wifiStalled {
+		return LinkWiFi
+	}
+	wFlows := activeFlows[LinkWiFi].Load()
+	cFlows := activeFlows[LinkCellular].Load()
+	wBps := ewmaGoodput[LinkWiFi].Load()
+	cBps := ewmaGoodput[LinkCellular].Load()
+	// Cold start or unmeasured link: ensure both links get flows to measure speed
+	if wBps < 64*1024 || cBps < 64*1024 {
+		if cFlows < wFlows {
+			return LinkCellular
+		}
+		if wFlows < cFlows {
+			return LinkWiFi
+		}
+		if rrCounter.Add(1)%2 == 0 {
+			return LinkCellular
+		}
+		return LinkWiFi
+	}
+	// Capacity-weighted per-flow bandwidth score: Goodput / (activeFlows + 1)
+	wScore := float64(wBps) / float64(wFlows+1)
+	cScore := float64(cBps) / float64(cFlows+1)
+	if cScore > wScore {
+		return LinkCellular
+	}
+	return LinkWiFi
+}
+
+// TrackFlow increments the active flow counter for the lifetime of a TCP stream.
+func TrackFlow(link LinkType) func() {
+	activeFlows[link].Add(1)
+	return func() { activeFlows[link].Add(-1) }
+}
+
 func toNAT64(ip4 net.IP) string {
 	ip4 = ip4.To4()
 	if ip4 == nil {
 		return ""
 	}
 	return net.IP{0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, ip4[0], ip4[1], ip4[2], ip4[3]}.String()
-}
-
-// StripedPreferredLink returns the link that should be preferred for the
-// next connection, based on fewest active flows (weighted striping).
-func StripedPreferredLink() LinkType {
-	wifi := activeFlows[LinkWiFi].Load()
-	cell := activeFlows[LinkCellular].Load()
-	if cell < wifi {
-		return LinkCellular
-	}
-	return LinkWiFi
-}
-
-// TrackFlow increments the active flow counter for link, returning a
-// function to call when the flow ends.
-func TrackFlow(link LinkType) func() {
-	activeFlows[link].Add(1)
-	return func() { activeFlows[link].Add(-1) }
 }
 
 // raceResult is the outcome of dialing one link.
@@ -75,21 +146,32 @@ func DialSpeculativeDualLink(
 
 	ch := make(chan raceResult, 2)
 
+	// Adaptive head-start: stagger the standby link by ~2x the preferred
+	// link's measured RTT (clamped 50-180ms), so the standby only wins if
+	// the primary is genuinely stalled.
+	headStart := 80 * time.Millisecond
+	if rttUs := ewmaRTTMicros[preferred].Load(); rttUs > 0 {
+		hs := time.Duration(rttUs*2) * time.Microsecond
+		if hs < 50*time.Millisecond {
+			hs = 50 * time.Millisecond
+		}
+		if hs > 180*time.Millisecond {
+			hs = 180 * time.Millisecond
+		}
+		headStart = hs
+	}
+
 	dialOne := func(link LinkType, ip string) {
 		if ip == "" {
 			ch <- raceResult{link: link, err: errNoAddr}
 			return
 		}
-		// Give preferred link a head start so it usually wins the race,
-		// while the other link serves as a warm standby for failover.
-		// 150ms is enough to overcome WiFi-vs-Cellular ping difference
-		// without adding noticeable latency to the connection setup.
 		if link != preferred {
 			select {
 			case <-ctx.Done():
 				ch <- raceResult{link: link, err: ctx.Err()}
 				return
-			case <-time.After(150 * time.Millisecond):
+			case <-time.After(headStart):
 			}
 		}
 		start := time.Now()
@@ -101,6 +183,12 @@ func DialSpeculativeDualLink(
 			if ip4 := net.ParseIP(ip); ip4 != nil && ip4.To4() != nil {
 				nat64 := toNAT64(ip4)
 				c, dErr = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
+			}
+		}
+		if dErr == nil && c != nil {
+			RecordLinkRTT(link, time.Since(start))
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
 			}
 		}
 		ch <- raceResult{conn: c, link: link, rtt: time.Since(start), err: dErr}
