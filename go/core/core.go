@@ -31,7 +31,7 @@ import (
 // BindAndProtect is the preferred path on Android: it calls
 // VpnService.protect(fd) AND Network.bindSocket() for the given network
 // type (1=Wi-Fi, 2=Cellular). Network.bindSocket sets the correct kernel
-// fwmark, which handles 464XLAT/CLAT on carriers like Jio — raw
+// fwmark, which handles 464XLAT/CLAT on carriers like Jio - raw
 // SO_BINDTOIFINDEX bypasses the translator and breaks IPv4.
 type Protector interface {
 	Protect(fd int)
