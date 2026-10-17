@@ -28,6 +28,10 @@ type SocketBinder interface {
 	// and protects it from the VPN. Returns false on failure, in which
 	// case the dial is aborted.
 	BindAndProtect(fd int64, networkType int) bool
+	// OnBytes reports bytes transferred on a VIP flow, so the Scheduler
+	// slots show real-time compounded throughput in the UI.
+	// networkType: 1=WiFi, 2=Cellular. rxBytes=download, txBytes=upload.
+	OnBytes(networkType int, rxBytes, txBytes int64)
 }
 
 // NewBoundDialer returns a net.Dialer whose sockets are bound to link and

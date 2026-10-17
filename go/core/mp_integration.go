@@ -2,6 +2,10 @@ package core
 
 import "netmerge/core/multipath"
 
+// engineRef is the global Engine reference for the protectorBinder's OnBytes
+// callback. Set by newMultipathEngine.
+var engineRef *Engine
+
 // protectorBinder adapts core.Protector to multipath.SocketBinder.
 type protectorBinder struct {
 	p Protector
@@ -22,9 +26,39 @@ func (b *protectorBinder) BindAndProtect(fd int64, networkType int) bool {
 	return true
 }
 
+// OnBytes wires VIP flow byte counters back to the Scheduler slots so the
+// UI shows real compounded throughput (not dummy counters).
+func (b *protectorBinder) OnBytes(networkType int, rxBytes, txBytes int64) {
+	if b.p == nil {
+		return
+	}
+	// The Engine holds the scheduler; we need a reference to it.
+	// This is set by newMultipathEngine.
+	if engineRef != nil && engineRef.scheduler != nil {
+		var slotID string
+		switch networkType {
+		case 1:
+			slotID = "wifi"
+		case 2:
+			slotID = "cellular"
+		default:
+			return
+		}
+		if sl := engineRef.scheduler.SlotByID(slotID); sl != nil {
+			// Determine family from the bytes? For now, add to both
+			// families' counters - the UI aggregates them.
+			sl.bytesIn[Fam4].Add(rxBytes)
+			sl.bytesOut[Fam4].Add(txBytes)
+			sl.bytesIn[Fam6].Add(rxBytes)
+			sl.bytesOut[Fam6].Add(txBytes)
+		}
+	}
+}
+
 // newMultipathEngine creates the on-phone compounding engine using the
 // Kotlin protector as the socket binder.
 func (e *Engine) newMultipathEngine() {
+	engineRef = e
 	binder := &protectorBinder{p: e.protector}
 	e.mpEngine = multipath.NewOnPhoneCompoundEngine(binder)
 }

@@ -135,6 +135,8 @@ func (f *fakeBinder) BindAndProtect(fd int64, networkType int) bool {
 	return !f.fail.Load()
 }
 
+func (f *fakeBinder) OnBytes(networkType int, rxBytes, txBytes int64) {}
+
 func TestBoundDialerUsesBinder(t *testing.T) {
 	fb := &fakeBinder{}
 	d := NewBoundDialer(fb, LinkCellular, 2*time.Second)

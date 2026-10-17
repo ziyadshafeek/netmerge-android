@@ -190,15 +190,33 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 
 	defer activeUpstream.Close()
 
-	// Full-duplex relay with goodput tracking
+	// Full-duplex relay with goodput tracking and half-close support.
+	// SAFETY: At this point, activeUpstream has either:
+	// - Responded with >0 bytes (primary won, standby closed), OR
+	// - Failed with 0 bytes (failover to standby, primary closed).
+	// We NEVER interleave bytes from two different upstream connections.
 	errCh := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(activeUpstream, initialReader)
+		// Upload: client -> upstream
+		written, err := io.Copy(activeUpstream, initialReader)
+		// Report upload bytes to scheduler slots via binder
+		if e.Binder != nil {
+			e.Binder.OnBytes(int(activeLink), 0, written)
+		}
+		// Half-close: signal EOF to upstream without closing the read side.
+		if cw, ok := activeUpstream.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
 		errCh <- err
 	}()
 	go func() {
 		start := time.Now()
+		// Download: upstream -> client
 		written, err := io.Copy(clientConn, activeUpstream)
+		// Report download bytes to scheduler slots via binder
+		if e.Binder != nil {
+			e.Binder.OnBytes(int(activeLink), written, 0)
+		}
 		// Record for ECT scheduler
 		if activeLink == LinkWiFi {
 			e.Scheduler.WiFi.RecordTransfer(written, time.Since(start))

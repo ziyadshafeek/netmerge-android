@@ -145,7 +145,22 @@ func (r *VIPResolver) resolveOnLink(ctx context.Context, domain string, link Lin
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "udp", dnsServer)
+			// Try the DNS server as-is first.
+			c, err := dialer.DialContext(ctx, "udp", dnsServer)
+			if err == nil {
+				return c, nil
+			}
+			// NAT64 fallback: if dnsServer is IPv4 and we're on cellular
+			// (likely IPv6-only like Jio), retry via 64:ff9b::/96.
+			if link == LinkCellular {
+				if host, port, serr := net.SplitHostPort(dnsServer); serr == nil {
+					if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+						nat64 := net.JoinHostPort("64:ff9b::"+ip.To4().String(), port)
+						return dialer.DialContext(ctx, "udp", nat64)
+					}
+				}
+			}
+			return nil, err
 		},
 	}
 	ipNet := "ip4"

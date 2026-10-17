@@ -137,6 +137,19 @@ func newScheduler(manual map[string]float64) *Scheduler {
 	}
 }
 
+// SlotByID returns the slot with the given canonical ID ("wifi" or "cellular"),
+// or nil if not found.
+func (s *Scheduler) SlotByID(id string) *Slot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sl := range s.slots {
+		if sl.ID == id {
+			return sl
+		}
+	}
+	return nil
+}
+
 func parseIP(s string) net.IP {
 	// Strip %interface zone ID: Android's Inet6Address.getHostAddress()
 	// appends e.g. "%rmnet_data0", and net.ParseIP returns nil for those.

@@ -20,6 +20,7 @@ import (
 type stubBinder struct{}
 
 func (stubBinder) BindAndProtect(fd int64, networkType int) bool { return true }
+func (stubBinder) OnBytes(networkType int, rxBytes, txBytes int64) {}
 
 // rangeHandler serves data with HTTP Range + ETag support. If ifRangeFail
 // is true it answers 200 OK (full body) whenever If-Range doesn't match

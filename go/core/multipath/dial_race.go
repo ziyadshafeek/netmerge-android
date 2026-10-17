@@ -5,8 +5,33 @@ package multipath
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"time"
 )
+
+// activeFlows tracks in-flight VIP connections per link for striping.
+// When Chrome opens N parallel TCP streams, we alternate the preferred
+// link so both Wi-Fi and Cellular carry traffic (not just the lower-ping
+// link winning 100% of races).
+var activeFlows [3]atomic.Int64 // indexed by LinkType (1=WiFi, 2=Cellular)
+
+// StripedPreferredLink returns the link that should be preferred for the
+// next connection, based on fewest active flows (weighted striping).
+func StripedPreferredLink() LinkType {
+	wifi := activeFlows[LinkWiFi].Load()
+	cell := activeFlows[LinkCellular].Load()
+	if cell < wifi {
+		return LinkCellular
+	}
+	return LinkWiFi
+}
+
+// TrackFlow increments the active flow counter for link, returning a
+// function to call when the flow ends.
+func TrackFlow(link LinkType) func() {
+	activeFlows[link].Add(1)
+	return func() { activeFlows[link].Add(-1) }
+}
 
 // raceResult is the outcome of dialing one link.
 type raceResult struct {
@@ -29,6 +54,14 @@ func DialSpeculativeDualLink(
 	port string,
 	preferred LinkType,
 ) (winner net.Conn, winnerLink LinkType, standbyCh <-chan raceResult, err error) {
+	// If no preferred link specified, use striped assignment so parallel
+	// connections spread across both links (not just the lower-ping one).
+	if preferred == 0 {
+		preferred = StripedPreferredLink()
+	}
+	// Track this flow on the preferred link for striping decisions.
+	defer TrackFlow(preferred)()
+
 	ch := make(chan raceResult, 2)
 
 	dialOne := func(link LinkType, ip string) {
@@ -36,13 +69,16 @@ func DialSpeculativeDualLink(
 			ch <- raceResult{link: link, err: errNoAddr}
 			return
 		}
-		// Give preferred link a tiny head start
+		// Give preferred link a head start so it usually wins the race,
+		// while the other link serves as a warm standby for failover.
+		// 150ms is enough to overcome WiFi-vs-Cellular ping difference
+		// without adding noticeable latency to the connection setup.
 		if link != preferred {
 			select {
 			case <-ctx.Done():
 				ch <- raceResult{link: link, err: ctx.Err()}
 				return
-			case <-time.After(8 * time.Millisecond):
+			case <-time.After(150 * time.Millisecond):
 			}
 		}
 		start := time.Now()

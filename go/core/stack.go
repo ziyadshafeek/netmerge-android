@@ -396,15 +396,27 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 		return false // ICMP port unreachable; nothing can carry it
 	}
 	if dstPort == 53 {
+		dnsFam := f
 		if dns := e.dnsServerFor(sl, f); dns != nil {
 			dstHost = dns.String() // dns.go: keep DNS on the right link
+			// Use the DNS server's actual family, not the VPN-local family.
+			// Jio cellular is IPv6-only: passing an IPv6 DNS with Fam4
+			// forces "udp4" and kills the dial with EAFNOSUPPORT.
+			if dns.To4() == nil {
+				dnsFam = Fam6
+			} else {
+				dnsFam = Fam4
+			}
 		} else if f == Fam4 {
 			// Jio IPv6-only cellular has no IPv4 DNS in LinkProperties;
 			// fall back to 8.8.8.8 (reached via NAT64) instead of 10.8.0.1
 			dstHost = "8.8.8.8"
+			dnsFam = Fam4
 		} else {
 			dstHost = "2001:4860:4860::8888"
+			dnsFam = Fam6
 		}
+		f = dnsFam
 	}
 
 	upstream, err := e.dialBoundUDP(sl, f, dstHost, dstPort)
@@ -464,7 +476,7 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 				return
 			}
 			us.touch()
-			us.slot.bytesIn[us.family].Add(int64(n))
+			us.slot.bytesOut[us.family].Add(int64(n))
 
 			// DNS interception: synthetic VIP response goes straight back.
 			if us.dstPort == 53 && e.mpEngine != nil {
@@ -499,7 +511,7 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 				return
 			}
 			us.touch()
-			us.slot.bytesOut[us.family].Add(int64(n))
+			us.slot.bytesIn[us.family].Add(int64(n))
 			if _, err := us.tunConn.WriteTo((*buf)[:n], clientAddr); err != nil {
 				return
 			}
