@@ -53,6 +53,8 @@ class NetMergeVpnService : VpnService() {
 
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var cellularCallback: ConnectivityManager.NetworkCallback? = null
+    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
     private var pushJob: Job? = null
     private var statsJob: Job? = null
 
@@ -177,6 +179,45 @@ class NetMergeVpnService : VpnService() {
         }
         networkCallback = cb
         cm.registerNetworkCallback(NetworkRequest.Builder().build(), cb)
+        // Force both transports to stay up simultaneously for bonding.
+        // requestNetwork() (not just register) asks the system to BRING UP
+        // the network even if it wouldn't be the default (e.g. cellular
+        // while on Wi-Fi). Without this, Android suspends mobile data.
+        try {
+            val cellReq = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+                .build()
+            cellularCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.i(TAG, "cellular network available: $network")
+                    schedulePush()
+                }
+                override fun onLost(network: Network) {
+                    Log.i(TAG, "cellular network lost")
+                    schedulePush()
+                }
+            }
+            cm.requestNetwork(cellReq, cellularCallback!!)
+            val wifiReq = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            wifiCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.i(TAG, "wifi network available: $network")
+                    schedulePush()
+                }
+                override fun onLost(network: Network) {
+                    Log.i(TAG, "wifi network lost")
+                    schedulePush()
+                }
+            }
+            cm.requestNetwork(wifiReq, wifiCallback!!)
+            Log.i(TAG, "requested both cellular and wifi networks")
+        } catch (t: Throwable) {
+            Log.w(TAG, "requestNetwork failed", t)
+        }
     }
 
     private fun schedulePush() {
@@ -360,6 +401,11 @@ class NetMergeVpnService : VpnService() {
 
     override fun onDestroy() {
         scope.cancel()
+        try {
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+            cellularCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+            wifiCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+        } catch (_: Exception) {}
         shutdownEngine()
         super.onDestroy()
     }
