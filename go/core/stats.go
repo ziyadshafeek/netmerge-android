@@ -31,8 +31,8 @@ func (e *Engine) statsJSON() string {
 	p := payload{Running: true, Networks: []netStat{}}
 	for _, sl := range e.scheduler.snapshot() {
 		// tx = bytes we sent upstream (upload), rx = bytes we got back.
-		tx := sl.bytesIn[Fam4].Load() + sl.bytesIn[Fam6].Load()
-		rx := sl.bytesOut[Fam4].Load() + sl.bytesOut[Fam6].Load()
+		tx := sl.bytesOut[Fam4].Load() + sl.bytesOut[Fam6].Load()
+		rx := sl.bytesIn[Fam4].Load() + sl.bytesIn[Fam6].Load()
 		ns := netStat{
 			ID: sl.ID, DisplayName: sl.DisplayName, Transport: sl.Transport,
 			State: combinedState(sl).String(),
