@@ -353,6 +353,11 @@ func udpKey(f Family, id stack.TransportEndpointID) string {
 
 // handleUDP runs for the first datagram of each new 5-tuple. Later
 // datagrams are delivered straight to the session's endpoint.
+func isSyntheticVIP(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
+}
+
 func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	defer func() { _ = recover() }()
 	id := r.ID()
@@ -360,6 +365,22 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	// for replies.
 	e.ensureAddr(id.LocalAddress)
 	f := familyOf(id.LocalAddress)
+	dstIP := tcpipToIP(id.LocalAddress)
+	dstHost, dstPort := dstIP.String(), int(id.LocalPort)
+
+	// Block QUIC (UDP/443), DNS-over-TLS (UDP/853), and any non-DNS UDP to
+	// synthetic 198.18.0.0/15 VIPs BEFORE CreateEndpoint so gVisor emits
+	// ICMP Port Unreachable. Chrome/YouTube get ECONNREFUSED and fall back
+	// to TCP/443 in <1ms instead of blackholing.
+	// Note: ALL UDP/443 is blocked (not just to VIPs) because:
+	// - QUIC only falls back to TCP during handshake, not mid-download
+	// - ElephantQUICGuard would kill established QUIC mid-stream (10-30s stall)
+	// - Chrome caches real IPs from before VPN start (bypasses VIPs)
+	// - Every QUIC server also speaks TCP/443 (HTTP/3 spec requirement)
+	if dstPort == 443 || dstPort == 853 || (dstPort != 53 && isSyntheticVIP(dstIP)) {
+		return false
+	}
+
 	key := udpKey(f, id)
 
 	e.udpMu.Lock()
@@ -369,8 +390,6 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	}
 	e.udpMu.Unlock()
 
-	dstHost, dstPort := tcpipToIP(id.LocalAddress).String(), int(id.LocalPort)
-
 	// Pick the network BEFORE dialing: DNS needs the slot's DNS server.
 	sl := e.scheduler.AcquireFor(f, nil)
 	if sl == nil {
@@ -379,6 +398,12 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	if dstPort == 53 {
 		if dns := e.dnsServerFor(sl, f); dns != nil {
 			dstHost = dns.String() // dns.go: keep DNS on the right link
+		} else if f == Fam4 {
+			// Jio IPv6-only cellular has no IPv4 DNS in LinkProperties;
+			// fall back to 8.8.8.8 (reached via NAT64) instead of 10.8.0.1
+			dstHost = "8.8.8.8"
+		} else {
+			dstHost = "2001:4860:4860::8888"
 		}
 	}
 
@@ -426,6 +451,7 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 	wg.Add(2)
 	go func() { // TUN -> upstream
 		defer wg.Done()
+		defer us.close() // wake up the upstream->TUN goroutine on exit
 		buf := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
 		for {
@@ -450,12 +476,8 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 				}
 			}
 
-			// Elephant QUIC guard: evict bulk QUIC to TCP.
-			if us.dstPort == 443 && e.mpEngine != nil {
-				if e.mpEngine.QUICGuard.OnUDPPacket(us.key, 0, us.dstHost, 443, n, true) {
-					return
-				}
-			}
+			// Note: QUIC (UDP/443) is blocked upfront in handleUDP with ICMP
+			// Port Unreachable, so no QUICGuard eviction is needed here.
 
 			if _, err := us.upstream.Write((*buf)[:n]); err != nil {
 				return
@@ -464,6 +486,7 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 	}()
 	go func() { // upstream -> TUN
 		defer wg.Done()
+		defer us.close() // wake up the TUN->upstream goroutine on exit
 		buf := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
 		for {

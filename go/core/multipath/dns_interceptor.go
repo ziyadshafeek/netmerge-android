@@ -66,7 +66,24 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 	qtype := binary.BigEndian.Uint16(query[pos : pos+2])
 	// qclass := binary.BigEndian.Uint16(query[pos+2 : pos+4])
 
-	// Only intercept A records (IPv4). AAAA goes upstream normally.
+	// Suppress AAAA (28), SVCB (64), and HTTPS (65) with empty NOERROR.
+	// Chrome/YouTube send parallel A/AAAA/HTTPS queries. If AAAA or HTTPS
+	// go upstream and return real IPv6 or HTTPS hints, Chrome bypasses the
+	// 198.18.x.x VIP and connects directly (no compounding). Returning
+	// NODATA forces all traffic through the IPv4 VIP -> TCP compounding.
+	if qtype == 28 || qtype == 64 || qtype == 65 {
+		resp := make([]byte, 0, len(query))
+		resp = append(resp, query[0:2]...) // ID
+		resp = append(resp, 0x81, 0x80)    // Flags: response, recursion available
+		resp = append(resp, 0x00, 0x01)    // QDCOUNT = 1
+		resp = append(resp, 0x00, 0x00)    // ANCOUNT = 0 (NODATA)
+		resp = append(resp, 0x00, 0x00)    // NSCOUNT = 0
+		resp = append(resp, 0x00, 0x00)    // ARCOUNT = 0
+		resp = append(resp, query[12:pos+4]...) // Question section
+		return resp
+	}
+
+	// Only intercept A records (IPv4). Other types go upstream normally.
 	if qtype != 1 {
 		return nil
 	}

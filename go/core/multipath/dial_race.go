@@ -48,6 +48,14 @@ func DialSpeculativeDualLink(
 		start := time.Now()
 		d := NewBoundDialer(binder, link, 5*time.Second)
 		c, dErr := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+		// NAT64 fallback: if dialing an IPv4 literal on cellular fails
+		// (Jio IPv6-only has no IPv4 route), retry via 64:ff9b::/96.
+		if dErr != nil && link == LinkCellular {
+			if ip4 := net.ParseIP(ip); ip4 != nil && ip4.To4() != nil {
+				nat64 := "64:ff9b::" + ip4.To4().String()
+				c, dErr = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
+			}
+		}
 		ch <- raceResult{conn: c, link: link, rtt: time.Since(start), err: dErr}
 	}
 
