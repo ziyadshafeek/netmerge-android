@@ -17,7 +17,6 @@ import (
 
 const (
 	MinCompoundSize int64 = 256 * 1024 // 256 KB minimum for single-stream HTTP range splicing
-	spliceChunkSize int64 = 256 * 1024 // 256 KB micro-segments for work-stealing
 )
 
 var relayBufPool = sync.Pool{
@@ -294,8 +293,20 @@ func (e *OnPhoneCompoundEngine) dialSplicerLink(ctx context.Context, link LinkTy
 	return DialLinkConn(ctx, e.Binder, link, ip, fallbackIP, port)
 }
 
+// selectSegmentSize returns the segment size for the given segment index:
+// fast 512KB first two segments, then 2MB (4MB for large files).
+func selectSegmentSize(totalSpan int64, segmentIndex int64) int64 {
+	if segmentIndex < 2 {
+		return 512 * 1024
+	}
+	if totalSpan >= 100*1024*1024 {
+		return 4 * 1024 * 1024
+	}
+	return 2 * 1024 * 1024
+}
+
 // compoundHTTPStream compounds a single HTTP GET (including explicit Range requests)
-// across BOTH Wi-Fi and Cellular simultaneously using 256 KB work-stealing micro-segments.
+// across BOTH Wi-Fi and Cellular simultaneously using work-stealing segments.
 func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	ctx context.Context,
 	clientConn net.Conn,
@@ -394,7 +405,23 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 		return err
 	}
 
-	numSegs := int((span + spliceChunkSize - 1) / spliceChunkSize)
+	// Dynamic segment sizing (Case B): 512KB x2 for fast time-to-first-byte,
+	// then 2MB (4MB for files >= 100MB). A 5GB file needs ~1,280 requests
+	// instead of 20,480, so CDNs don't rate-limit and TCP cwnd stays at full
+	// 5G/Wi-Fi BDP instead of stalling every 256KB on a request/response RTT.
+	segOffsets := []int64{reqStart}
+	for off := reqStart; off <= reqEnd; {
+		sz := selectSegmentSize(span, int64(len(segOffsets)-1))
+		if off+sz > reqEnd+1 {
+			sz = reqEnd + 1 - off
+		}
+		if sz <= 0 {
+			break
+		}
+		off += sz
+		segOffsets = append(segOffsets, off)
+	}
+	numSegs := len(segOffsets) - 1
 	type segResult struct {
 		data []byte
 		err  error
@@ -427,11 +454,8 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 		}()
 
 		fetchSeg := func(idx int) ([]byte, error) {
-			sStart := reqStart + int64(idx)*spliceChunkSize
-			sEnd := sStart + spliceChunkSize - 1
-			if sEnd > reqEnd {
-				sEnd = reqEnd
-			}
+			sStart := segOffsets[idx]
+			sEnd := segOffsets[idx+1] - 1
 			expected := int(sEnd - sStart + 1)
 
 			if conn == nil {
@@ -556,6 +580,12 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 		}
 	}
 
+	// Hard-pinned per-radio workers (Case C): 2x Wi-Fi + 2x Cellular, all
+	// pulling from the same shared segment queue. Neither radio can ever sit
+	// idle, and the second worker per link hides the HTTP request/response
+	// RTT gap. The faster radio naturally drains more segments.
+	go worker(LinkWiFi, wifiAddr, cellAddr)
+	go worker(LinkCellular, cellAddr, wifiAddr)
 	go worker(LinkWiFi, wifiAddr, cellAddr)
 	go worker(LinkCellular, cellAddr, wifiAddr)
 
