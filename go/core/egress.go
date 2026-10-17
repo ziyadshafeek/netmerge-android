@@ -66,14 +66,24 @@ var testDialRewrite map[string]string
 // still carries traffic; the scheduler prefers pinned links when pinning
 // works.
 func (e *Engine) dialBound(sl *Slot, f Family, proto, host string, port int, timeout time.Duration) (net.Conn, error) {
+	// If cellular only has IPv6 (Jio) and caller asked for IPv4 (Fam4),
+	// try direct Fam4 first (in case Android clatd is active on the Network);
+	// if sl has no IPv4 or direct Fam4 fails, synthesize NAT64 (64:ff9b::/96) over Fam6!
+	if sl.Transport == "CELLULAR" && f == Fam4 && sl.ip(Fam4) == nil && sl.ip(Fam6) != nil {
+		if c, err := e.dialWith(sl, f, proto, host, port, timeout, true); err == nil {
+			return c, nil
+		}
+		if nat64Host := synthesizeNAT64(host); nat64Host != "" {
+			if c6, err6 := e.dialWith(sl, Fam6, proto, nat64Host, port, timeout, true); err6 == nil {
+				return c6, nil
+			}
+		}
+	}
+
 	c, err := e.dialWith(sl, f, proto, host, port, timeout, true)
 	if err == nil || !isLinkDown(err) {
 		return c, err
 	}
-	// NAT64 fallback: if this is cellular (e.g. Jio IPv6-only) and the target
-	// is an IPv4 literal that failed with ENETUNREACH, try RFC 6052 synthesis
-	// (64:ff9b::/96) over native IPv6. This handles the case where Android
-	// doesn't run clatd on the secondary cellular interface.
 	if sl.Transport == "CELLULAR" && f == Fam4 {
 		if nat64Host := synthesizeNAT64(host); nat64Host != "" {
 			if c6, err6 := e.dialWith(sl, Fam6, proto, nat64Host, port, timeout, true); err6 == nil {
@@ -122,7 +132,9 @@ func (e *Engine) protectOnlyControl() func(network, address string, c syscall.Ra
 
 func (e *Engine) dialWith(sl *Slot, f Family, proto, host string, port int, timeout time.Duration, pin bool) (net.Conn, error) {
 	ip := sl.ip(f)
-	if pin && ip == nil {
+	// Allow pin=true even if ip==nil when using Android Protector
+	// (Network.bindSocket handles interface/source selection, including CLAT).
+	if pin && ip == nil && e.protector == nil {
 		return nil, &linkError{err: errors.New("network has no address for this family"), down: true}
 	}
 	if testDialRewrite != nil {
@@ -137,10 +149,15 @@ func (e *Engine) dialWith(sl *Slot, f Family, proto, host string, port int, time
 	var local net.Addr
 	var control func(network, address string, c syscall.RawConn) error
 	if pin {
-		if proto == "tcp" {
-			local = &net.TCPAddr{IP: ip}
-		} else {
-			local = &net.UDPAddr{IP: ip}
+		// Only set LocalAddr when there is NO Android Protector (desktop/tests).
+		// On Android, Network.bindSocket() selects the right source IP
+		// (including CLAT 192.0.0.x); forcing LocalAddr breaks 464XLAT/NAT64.
+		if e.protector == nil && ip != nil {
+			if proto == "tcp" {
+				local = &net.TCPAddr{IP: ip}
+			} else {
+				local = &net.UDPAddr{IP: ip}
+			}
 		}
 		control = e.egressControl(sl)
 	} else {

@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,6 +94,30 @@ func (sl *Slot) ip(f Family) net.IP {
 	return nil
 }
 
+// canCarry reports whether this slot can carry flows of family f.
+// An IPv6-only cellular network (Jio) can still carry IPv4 (Fam4) flows
+// via Android's 464XLAT (bound via Network.bindSocket) or our RFC 6052
+// NAT64 synthesis in egress.go.
+func (sl *Slot) canCarry(f Family) bool {
+	if sl.ip(f) != nil {
+		return true
+	}
+	if f == Fam4 && sl.Transport == "CELLULAR" && sl.ip(Fam6) != nil {
+		return true
+	}
+	return false
+}
+
+// effectiveFamily returns the family whose probe state/weight should be
+// consulted for flows of family f. For IPv6-only cellular carrying IPv4
+// via NAT64/CLAT, the Fam6 state applies.
+func (sl *Slot) effectiveFamily(f Family) Family {
+	if sl.ip(f) == nil && f == Fam4 && sl.Transport == "CELLULAR" && sl.ip(Fam6) != nil {
+		return Fam6
+	}
+	return f
+}
+
 // Scheduler is weighted least-active-flows, per address family: each new
 // flow goes to the network with the lowest (active+1)/weight among the
 // eligible ones. Only new flows take the lock.
@@ -113,6 +138,11 @@ func newScheduler(manual map[string]float64) *Scheduler {
 }
 
 func parseIP(s string) net.IP {
+	// Strip %interface zone ID: Android's Inet6Address.getHostAddress()
+	// appends e.g. "%rmnet_data0", and net.ParseIP returns nil for those.
+	if i := strings.IndexByte(s, '%'); i >= 0 {
+		s = s[:i]
+	}
 	ip := net.ParseIP(s)
 	if ip == nil {
 		return nil
@@ -309,17 +339,20 @@ func (s *Scheduler) AcquireFor(f Family, skip map[string]struct{}) *Slot {
 	// somewhere rather than nowhere.
 	var tiers [3][]*Slot
 	for _, sl := range s.slots {
-		if !sl.present || sl.ip(f) == nil {
+		if !sl.present || !sl.canCarry(f) {
 			continue
 		}
 		if _, no := skip[sl.ID]; no {
 			continue
 		}
+		// For IPv6-only cellular carrying IPv4 via NAT64/CLAT, use the
+		// Fam6 probe state — that's the family that was actually probed.
+		ef := sl.effectiveFamily(f)
 		t := 1
 		switch {
-		case now.Before(sl.downUntil[f]) || sl.state[f] == stateDown:
+		case now.Before(sl.downUntil[ef]) || sl.state[ef] == stateDown:
 			t = 2
-		case sl.state[f] == stateUp:
+		case sl.state[ef] == stateUp:
 			t = 0
 		}
 		tiers[t] = append(tiers[t], sl)

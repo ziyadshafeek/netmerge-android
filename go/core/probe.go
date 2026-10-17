@@ -1,6 +1,9 @@
 package core
 
 import (
+	"net"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -85,15 +88,13 @@ func (e *Engine) runProbe(sl *Slot, f Family) {
 }
 
 func splitHostPort(hp string) (string, int) {
-	// targets are constants; keep it simple and panic-free.
-	for i := len(hp) - 1; i >= 0; i-- {
-		if hp[i] == ':' {
-			port := 0
-			for _, c := range hp[i+1:] {
-				port = port*10 + int(c-'0')
-			}
-			return hp[:i], port
-		}
+	host, portStr, err := net.SplitHostPort(hp)
+	if err != nil {
+		return strings.Trim(hp, "[]"), 443
 	}
-	return hp, 443
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return host, 443
+	}
+	return host, port
 }

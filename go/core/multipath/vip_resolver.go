@@ -70,6 +70,18 @@ func (r *VIPResolver) GetOrAllocateVIP(ctx context.Context, domain string) (net.
 
 	wifiAddr, cellAddr := r.resolveAddrs(ctx, domain)
 
+	// Never cache a completely empty endpoint — it blackholes all traffic
+	// to this domain forever. If one side resolved, copy it as fallback.
+	if wifiAddr == "" && cellAddr == "" {
+		return nil, nil
+	}
+	if wifiAddr == "" {
+		wifiAddr = cellAddr
+	}
+	if cellAddr == "" {
+		cellAddr = wifiAddr
+	}
+
 	// Slow path: allocate under the write lock, re-checking for a lost race.
 	r.mu.Lock()
 	defer r.mu.Unlock()

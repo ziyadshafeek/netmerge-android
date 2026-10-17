@@ -198,6 +198,9 @@ class NetMergeVpnService : VpnService() {
                         schedulePush()
                     }
                 }
+                // onAvailable fires BEFORE IPs/DNS are assigned; refresh when they arrive.
+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = schedulePush()
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = schedulePush()
             }
             cm.requestNetwork(wifiReq, wifiCallback!!)
             val cellReq = NetworkRequest.Builder()
@@ -218,6 +221,9 @@ class NetMergeVpnService : VpnService() {
                         schedulePush()
                     }
                 }
+                // onAvailable fires BEFORE IPs/DNS are assigned; refresh when they arrive.
+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = schedulePush()
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = schedulePush()
             }
             cm.requestNetwork(cellReq, cellularCallback!!)
             Log.i(TAG, "requested both cellular and wifi networks")
@@ -302,10 +308,11 @@ class NetMergeVpnService : VpnService() {
                 val addr = la.address ?: continue
                 if (addr.isLinkLocalAddress || addr.isLoopbackAddress) continue
                 if (addr is Inet4Address && ipv4.isEmpty()) ipv4 = addr.hostAddress ?: ""
-                if (addr is Inet6Address && ipv6.isEmpty()) ipv6 = addr.hostAddress ?: ""
+                // Strip %interface zone ID: Go's net.ParseIP returns nil for "fe80::1%wlan0".
+                if (addr is Inet6Address && ipv6.isEmpty()) ipv6 = (addr.hostAddress ?: "").substringBefore('%')
             }
             val dns = JSONArray()
-            for (d in lp.dnsServers) { d.hostAddress?.let { dns.put(it) } }
+            for (d in lp.dnsServers) { d.hostAddress?.substringBefore('%')?.let { dns.put(it) } }
             JSONObject()
                 .put("id", id)
                 .put("name", ifName)
