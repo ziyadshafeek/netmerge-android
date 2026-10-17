@@ -372,13 +372,7 @@ class NetMergeVpnService : VpnService() {
     // ---- teardown ----
 
     private fun shutdownEngine() {
-        networkCallback?.let { cb ->
-            try {
-                connectivityManager?.unregisterNetworkCallback(cb)
-            } catch (_: Exception) {
-            }
-        }
-        networkCallback = null
+        unregisterNetworkTracking()
         connectivityManager = null
         pushJob?.cancel()
         pushJob = null
