@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -13,59 +14,102 @@ type Racer struct {
 	binder    SocketBinder
 	resolver  *VIPResolver
 	scheduler *Scheduler
+	pacerOnce sync.Once
 }
 
 func NewRacer(binder SocketBinder, resolver *VIPResolver, scheduler *Scheduler) *Racer {
-	return &Racer{
+	r := &Racer{
 		binder:    binder,
 		resolver:  resolver,
 		scheduler: scheduler,
 	}
+	r.startCellularKeepAwake()
+	return r
 }
 
-// Scheduler exposes the BDP-aware link scheduler driving dial decisions.
-func (r *Racer) Scheduler() *Scheduler {
-	return r.scheduler
+// startCellularKeepAwake prevents the 5G NR modem from dropping into deep RRC_IDLE
+// sleep when Wi-Fi is carrying long-lived flows, keeping 5G carrier aggregation ready.
+func (r *Racer) startCellularKeepAwake() {
+	r.pacerOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(6 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				wStats := r.scheduler.Stats(LinkWiFi)
+				cStats := r.scheduler.Stats(LinkCellular)
+				if wStats.ActiveFlows > 0 && cStats.ActiveFlows == 0 {
+					ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+					if r.resolver != nil {
+						_ = r.resolver.queryUDPOnLink(ctx, "cloudflare.com", 28, LinkCellular)
+					}
+					cancel()
+				}
+			}
+		}()
+	})
 }
 
-// DialContext intercepts synthetic VIPs (198.18.0.0/15) or domain/IP targets and
-// races bound connections across Wi-Fi and Jio 5G according to Scheduler weights.
-func (r *Racer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
+// resolveLinkTargets resolves optimal per-link addresses and a Cellular fallback
+// address (so Cellular can seamlessly retry NAT64 IPv6 <-> raw IPv4 on connect).
+func (r *Racer) resolveLinkTargets(ctx context.Context, address string) (wifiTarget, cellTarget, cellFallback string, err error) {
+	host, port, splitErr := net.SplitHostPort(address)
+	if splitErr != nil {
+		return "", "", "", splitErr
 	}
 
-	var wifiTarget, cellTarget string
+	buildCellPair := func(primaryAddr, rawV4 string) (string, string) {
+		if ip := net.ParseIP(primaryAddr); ip != nil {
+			if ip.To4() != nil {
+				// Primary is IPv4: provide raw IPv4 and NAT64 IPv6 fallback.
+				if synth := SynthesizeCarrierNAT64(ip); synth != "" {
+					return net.JoinHostPort(primaryAddr, port), net.JoinHostPort(synth, port)
+				}
+				return net.JoinHostPort(primaryAddr, port), ""
+			}
+			// Primary is IPv6: provide IPv6 first and raw IPv4 (CLAT) as fallback.
+			if rawV4 != "" {
+				return net.JoinHostPort(primaryAddr, port), net.JoinHostPort(rawV4, port)
+			}
+			return net.JoinHostPort(primaryAddr, port), ""
+		}
+		return net.JoinHostPort(primaryAddr, port), ""
+	}
+
 	if ip := net.ParseIP(host); ip != nil {
-		if ep, ok := r.resolver.LookupVIP(ip); ok {
-			wAddr, cAddr := ep.WaitReady(ctx)
-			if wAddr != "" {
-				wifiTarget = net.JoinHostPort(wAddr, port)
+		if r.resolver != nil {
+			if ep, ok := r.resolver.LookupVIP(ip); ok {
+				wAddr, cAddr := ep.WaitReady(ctx)
+				ep.mu.RLock()
+				rawV4 := ep.CellRawV4
+				ep.mu.RUnlock()
+				if wAddr != "" {
+					wifiTarget = net.JoinHostPort(wAddr, port)
+				}
+				if cAddr != "" {
+					cellTarget, cellFallback = buildCellPair(cAddr, rawV4)
+				}
 			}
-			if cAddr != "" {
-				cellTarget = net.JoinHostPort(cAddr, port)
-			}
-		} else if ip.To4() != nil {
+		}
+		if wifiTarget == "" && cellTarget == "" {
 			wifiTarget = address
-			if synth := SynthesizeCarrierNAT64(ip); synth != "" {
-				cellTarget = net.JoinHostPort(synth, port)
+			if ip.To4() != nil {
+				cellTarget, cellFallback = buildCellPair(host, host)
 			} else {
 				cellTarget = address
 			}
-		} else {
-			wifiTarget = address
-			cellTarget = address
 		}
-	} else {
+	} else if r.resolver != nil {
 		_, ep := r.resolver.GetOrAllocate(ctx, host)
 		if ep != nil {
 			wAddr, cAddr := ep.WaitReady(ctx)
+			ep.mu.RLock()
+			rawV4 := ep.CellRawV4
+			ep.mu.RUnlock()
 			if wAddr != "" {
 				wifiTarget = net.JoinHostPort(wAddr, port)
 			}
 			if cAddr != "" {
-				cellTarget = net.JoinHostPort(cAddr, port)
+				cellTarget, cellFallback = buildCellPair(cAddr, rawV4)
 			}
 		}
 	}
@@ -78,43 +122,32 @@ func (r *Racer) DialContext(ctx context.Context, network, address string) (net.C
 	} else if cellTarget == "" {
 		cellTarget = wifiTarget
 	}
-
-	primary, secondary, stagger := r.scheduler.SelectLinks(256 * 1024)
-	return r.raceTargets(ctx, network, primary, secondary, stagger, wifiTarget, cellTarget)
+	return wifiTarget, cellTarget, cellFallback, nil
 }
 
-// DialLink opens a metered connection strictly pinned to a single physical link
-// (used by parallel HTTP Range chunk workers to saturate both radios simultaneously).
-func (r *Racer) DialLink(ctx context.Context, network string, link LinkType, host string, port int) (*MeteredConn, error) {
-	portStr := strconv.Itoa(port)
-	target := net.JoinHostPort(host, portStr)
-
-	if ip := net.ParseIP(host); ip != nil {
-		if ep, ok := r.resolver.LookupVIP(ip); ok {
-			wAddr, cAddr := ep.WaitReady(ctx)
-			if link == LinkCellular && cAddr != "" {
-				target = net.JoinHostPort(cAddr, portStr)
-			} else if link == LinkWiFi && wAddr != "" {
-				target = net.JoinHostPort(wAddr, portStr)
-			}
-		} else if link == LinkCellular && ip.To4() != nil {
-			if synth := SynthesizeCarrierNAT64(ip); synth != "" {
-				target = net.JoinHostPort(synth, portStr)
-			}
-		}
-	} else if r.resolver != nil {
-		_, ep := r.resolver.GetOrAllocate(ctx, host)
-		if ep != nil {
-			wAddr, cAddr := ep.WaitReady(ctx)
-			if link == LinkCellular && cAddr != "" {
-				target = net.JoinHostPort(cAddr, portStr)
-			} else if link == LinkWiFi && wAddr != "" {
-				target = net.JoinHostPort(wAddr, portStr)
-			}
-		}
+// DialContext dispatches connections across Wi-Fi and Cellular according to
+// the Scheduler's active flow-ratio controller and deficit water-filling weights.
+func (r *Racer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	wifiTarget, cellTarget, cellFallback, err := r.resolveLinkTargets(ctx, address)
+	if err != nil {
+		return nil, err
 	}
 
-	return r.dialSingle(ctx, network, link, target)
+	primary, secondary, stagger := r.scheduler.SelectLinks(256 * 1024)
+	return r.raceTargets(ctx, network, primary, secondary, stagger, wifiTarget, cellTarget, cellFallback)
+}
+
+// DialLink opens a metered connection strictly pinned to a single physical link.
+func (r *Racer) DialLink(ctx context.Context, network string, link LinkType, host string, port int) (*MeteredConn, error) {
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	wifiTarget, cellTarget, cellFallback, err := r.resolveLinkTargets(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	if link == LinkCellular {
+		return r.dialSingleWithFallback(ctx, network, LinkCellular, cellTarget, cellFallback)
+	}
+	return r.dialSingleWithFallback(ctx, network, LinkWiFi, wifiTarget, "")
 }
 
 func (r *Racer) raceTargets(
@@ -122,18 +155,18 @@ func (r *Racer) raceTargets(
 	network string,
 	primary, secondary LinkType,
 	stagger time.Duration,
-	wifiTarget, cellTarget string,
+	wifiTarget, cellTarget, cellFallback string,
 ) (net.Conn, error) {
 	type dialResult struct {
 		conn *MeteredConn
 		err  error
 	}
 
-	targetFor := func(l LinkType) string {
+	targetFor := func(l LinkType) (string, string) {
 		if l == LinkCellular {
-			return cellTarget
+			return cellTarget, cellFallback
 		}
-		return wifiTarget
+		return wifiTarget, ""
 	}
 
 	raceCtx, cancel := context.WithCancel(ctx)
@@ -141,9 +174,10 @@ func (r *Racer) raceTargets(
 
 	resCh := make(chan dialResult, 2)
 
-	// Launch primary path immediately.
+	// Launch primary assigned link immediately.
 	go func() {
-		c, err := r.dialSingle(raceCtx, network, primary, targetFor(primary))
+		t1, fb1 := targetFor(primary)
+		c, err := r.dialSingleWithFallback(raceCtx, network, primary, t1, fb1)
 		resCh <- dialResult{conn: c, err: err}
 	}()
 
@@ -159,17 +193,17 @@ func (r *Racer) raceTargets(
 			return res.conn, nil
 		}
 		firstErr = res.err
-		// Primary failed before stagger expired; fire secondary immediately.
 		launchedSecondary = true
 		go func() {
-			c, err := r.dialSingle(raceCtx, network, secondary, targetFor(secondary))
+			t2, fb2 := targetFor(secondary)
+			c, err := r.dialSingleWithFallback(raceCtx, network, secondary, t2, fb2)
 			resCh <- dialResult{conn: c, err: err}
 		}()
 	case <-timer.C:
-		// Primary still in flight after stagger; launch secondary in parallel.
 		launchedSecondary = true
 		go func() {
-			c, err := r.dialSingle(raceCtx, network, secondary, targetFor(secondary))
+			t2, fb2 := targetFor(secondary)
+			c, err := r.dialSingleWithFallback(raceCtx, network, secondary, t2, fb2)
 			resCh <- dialResult{conn: c, err: err}
 		}()
 	case <-ctx.Done():
@@ -185,7 +219,7 @@ func (r *Racer) raceTargets(
 		select {
 		case res := <-resCh:
 			if res.err == nil {
-				cancel() // Cancel the losing in-flight dialer; if it still connects, drain & close it.
+				cancel()
 				if i == 0 && remaining == 2 && launchedSecondary {
 					go func() {
 						if late := <-resCh; late.conn != nil {
@@ -209,16 +243,31 @@ func (r *Racer) raceTargets(
 	return nil, errors.New("multipath: all links failed to connect")
 }
 
-func (r *Racer) dialSingle(ctx context.Context, network string, link LinkType, target string) (*MeteredConn, error) {
+// dialSingleWithFallback dials `target` on `link` (routing through the link's
+// configured Privacy Egress if enabled), and if a direct Cellular address-family
+// mismatch occurs (IPv4 vs NAT64 IPv6), immediately tries `fallbackTarget`.
+func (r *Racer) dialSingleWithFallback(
+	ctx context.Context,
+	network string,
+	link LinkType,
+	target, fallbackTarget string,
+) (*MeteredConn, error) {
 	dialer := NewBoundDialer(r.binder, link, 5*time.Second)
+	privacyEgress := GlobalPrivacy.EgressForLink(link)
+
 	start := time.Now()
-	c, err := dialer.DialContext(ctx, network, target)
+	c, err := DialThroughPrivacyEgress(ctx, dialer, privacyEgress, network, target)
+	if err != nil && fallbackTarget != "" && fallbackTarget != target && ctx.Err() == nil {
+		start = time.Now()
+		c, err = DialThroughPrivacyEgress(ctx, dialer, privacyEgress, network, fallbackTarget)
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			r.scheduler.RecordFailure(link)
 		}
 		return nil, err
 	}
+
 	rtt := time.Since(start)
 	r.scheduler.RecordRTT(link, rtt)
 	r.scheduler.RecordSuccess(link)

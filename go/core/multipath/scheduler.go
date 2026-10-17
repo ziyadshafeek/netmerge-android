@@ -33,6 +33,7 @@ type linkTracker struct {
 	windowBytes   int64
 	windowStart   time.Time
 	lastUpdated   time.Time
+	lastFailAt    time.Time
 	activeFlows   atomic.Int64
 	totalBytes    atomic.Int64
 	consecFails   atomic.Uint32
@@ -50,16 +51,18 @@ func NewScheduler() *Scheduler {
 		wifi: &linkTracker{
 			link:        LinkWiFi,
 			srttNs:      int64(18 * time.Millisecond),
+			rttVarNs:    int64(6 * time.Millisecond),
 			minRttNs:    int64(10 * time.Millisecond),
-			smoothedBps: 4 * 1024 * 1024, // 32 Mbps initial prior
+			smoothedBps: 5 * 1024 * 1024, // 40 Mbps initial prior
 			windowStart: now,
 			lastUpdated: now,
 		},
 		cellular: &linkTracker{
 			link:        LinkCellular,
-			srttNs:      int64(32 * time.Millisecond),
-			minRttNs:    int64(20 * time.Millisecond),
-			smoothedBps: 6 * 1024 * 1024, // 48 Mbps initial 5G prior so 5G is probed immediately
+			srttNs:      int64(38 * time.Millisecond),
+			rttVarNs:    int64(14 * time.Millisecond),
+			minRttNs:    int64(22 * time.Millisecond),
+			smoothedBps: 7 * 1024 * 1024, // 56 Mbps initial 5G prior
 			windowStart: now,
 			lastUpdated: now,
 		},
@@ -73,7 +76,6 @@ func (s *Scheduler) tracker(link LinkType) *linkTracker {
 	return s.wifi
 }
 
-// RecordRTT updates Jacobson/Karels SRTT and minimum RTT estimates per physical link.
 func (s *Scheduler) RecordRTT(link LinkType, rtt time.Duration) {
 	if rtt <= 0 {
 		return
@@ -102,7 +104,6 @@ func (s *Scheduler) RecordRTT(link LinkType, rtt time.Duration) {
 	t.consecFails.Store(0)
 }
 
-// RecordBytes updates real-time sliding-window goodput and peak capacity per link.
 func (s *Scheduler) RecordBytes(link LinkType, n int64, elapsed time.Duration) {
 	if n <= 0 {
 		return
@@ -115,19 +116,17 @@ func (s *Scheduler) RecordBytes(link LinkType, n int64, elapsed time.Duration) {
 	t.mu.Lock()
 	t.windowBytes += n
 	winDur := now.Sub(t.windowStart)
-	if winDur >= 120*time.Millisecond {
+	if winDur >= 100*time.Millisecond {
 		instBps := float64(t.windowBytes) / winDur.Seconds()
 		if instBps > t.smoothedBps {
-			// Fast attack when link ramps up (critical for 5G NR carrier aggregation).
-			t.smoothedBps = 0.45*t.smoothedBps + 0.55*instBps
+			t.smoothedBps = 0.40*t.smoothedBps + 0.60*instBps
 		} else {
-			// Slow decay during brief burst pauses so capacity estimate remains stable.
-			t.smoothedBps = 0.85*t.smoothedBps + 0.15*instBps
+			t.smoothedBps = 0.88*t.smoothedBps + 0.12*instBps
 		}
 		if instBps > t.peakBps {
 			t.peakBps = instBps
 		} else {
-			t.peakBps *= 0.995
+			t.peakBps *= 0.996
 		}
 		t.windowBytes = 0
 		t.windowStart = now
@@ -144,10 +143,11 @@ func (s *Scheduler) RecordFailure(link LinkType) {
 	t := s.tracker(link)
 	fails := t.consecFails.Add(1)
 	t.mu.Lock()
-	if fails >= 2 {
-		t.smoothedBps *= 0.5
-		if t.smoothedBps < 128*1024 {
-			t.smoothedBps = 128 * 1024
+	t.lastFailAt = time.Now()
+	if fails >= 3 {
+		t.smoothedBps *= 0.65
+		if t.smoothedBps < 512*1024 {
+			t.smoothedBps = 512 * 1024
 		}
 	}
 	t.mu.Unlock()
@@ -179,9 +179,17 @@ func (s *Scheduler) Stats(link LinkType) LinkStats {
 	smoothed := t.smoothedBps
 	peak := t.peakBps
 	updated := t.lastUpdated
+	lastFail := t.lastFailAt
 	t.mu.RUnlock()
 
 	fails := t.consecFails.Load()
+	// Auto-heal consecutive failures after 4 seconds so a transient 5G handover
+	// never permanently marks Cellular unhealthy.
+	if fails >= 5 && !lastFail.IsZero() && time.Since(lastFail) > 4*time.Second {
+		t.consecFails.Store(2)
+		fails = 2
+	}
+
 	return LinkStats{
 		Link:          link,
 		SRTT:          srtt,
@@ -192,17 +200,14 @@ func (s *Scheduler) Stats(link LinkType) LinkStats {
 		ActiveFlows:   t.activeFlows.Load(),
 		TotalBytes:    t.totalBytes.Load(),
 		ConsecFails:   fails,
-		Healthy:       fails < 4,
+		Healthy:       fails < 5,
 		LastUpdatedAt: updated,
 	}
 }
 
-// EstimatedCompletionTime calculates the expected time in seconds to transfer
-// payloadBytes over the target link, accounting for queuing delay, active flow
-// contention, and 5G NR RLC/PDCP bufferbloat inflation.
 func (s *Scheduler) EstimatedCompletionTime(link LinkType, payloadBytes int64) float64 {
 	if payloadBytes <= 0 {
-		payloadBytes = 64 * 1024
+		payloadBytes = 128 * 1024
 	}
 	t := s.tracker(link)
 	t.mu.RLock()
@@ -219,102 +224,131 @@ func (s *Scheduler) EstimatedCompletionTime(link LinkType, payloadBytes int64) f
 		minRttSec = srttSec
 	}
 	if peak > bps {
-		// Blend smoothed rate with 35% of observed peak so bursty 5G channels
-		// aren't undervalued between active windows.
-		bps = 0.65*bps + 0.35*peak
+		bps = 0.55*bps + 0.45*peak
 	}
-	if bps < 128*1024 {
-		bps = 128 * 1024
+	if bps < 512*1024 {
+		bps = 512 * 1024
 	}
 
 	active := float64(t.activeFlows.Load())
-	effectiveBps := bps / (1.0 + 0.35*active)
+	// Penalize links with many active flows so new flows spill over onto the second link.
+	effectiveBps := bps / (1.0 + 0.55*active)
 
-	// Bufferbloat penalty: if standing queue inflates SRTT far above MinRTT,
-	// penalize new flow assignment proportionally.
 	bloatRatio := srttSec / minRttSec
-	if bloatRatio > 2.5 {
-		bloatRatio = 2.5
+	if bloatRatio > 2.2 {
+		bloatRatio = 2.2
 	}
 
 	transferSec := float64(payloadBytes) / effectiveBps
-	penalty := 1.0 + 0.6*float64(t.consecFails.Load())
+	penalty := 1.0 + 0.35*float64(t.consecFails.Load())
 	return (srttSec*bloatRatio + transferSec) * penalty
 }
 
-// SelectLinks chooses the primary and secondary physical links for a new flow
-// using Deficit Inverse-Completion-Time water-filling and computes the optimal
-// head-start stagger before launching the secondary racer socket.
+// SelectLinks assigns the primary and secondary links for a new flow and returns
+// a realistic failover delay (`stagger`) that allows the assigned link (especially
+// 5G NR) to complete its TCP handshake without being hijacked by Wi-Fi's shorter RTT.
 func (s *Scheduler) SelectLinks(expectedBytes int64) (primary LinkType, secondary LinkType, stagger time.Duration) {
 	seq := s.dispatchN.Add(1)
 
 	wStats := s.Stats(LinkWiFi)
 	cStats := s.Stats(LinkCellular)
 
-	// If one link is unhealthy, immediately promote the healthy survivor.
 	if !wStats.Healthy && cStats.Healthy {
-		return LinkCellular, LinkWiFi, 180 * time.Millisecond
+		return LinkCellular, LinkWiFi, 350 * time.Millisecond
 	}
 	if !cStats.Healthy && wStats.Healthy {
-		return LinkWiFi, LinkCellular, 180 * time.Millisecond
+		return LinkWiFi, LinkCellular, 250 * time.Millisecond
 	}
 
-	// Active Dual-Path Probing: every 4th flow or when Cellular has 0 active flows
-	// while Wi-Fi is busy, force a probe on Jio 5G so 5G NR RRC stays in
-	// RRC_CONNECTED with MIMO carrier aggregation awake.
-	if (seq%4 == 0) || (cStats.ActiveFlows == 0 && wStats.ActiveFlows >= 1) {
-		return LinkCellular, LinkWiFi, 20 * time.Millisecond
+	// Calculate target bandwidth share with a guaranteed minimum 40% floor for Cellular
+	// so both radios always stay saturated in parallel.
+	wCap := math.Max(wStats.SmoothedBps, 0.6*wStats.PeakBps)
+	cCap := math.Max(cStats.SmoothedBps, 0.6*cStats.PeakBps)
+	if wCap < 512*1024 {
+		wCap = 512 * 1024
 	}
-	if wStats.ActiveFlows == 0 && cStats.ActiveFlows >= 2 {
-		return LinkWiFi, LinkCellular, 20 * time.Millisecond
+	if cCap < 512*1024 {
+		cCap = 512 * 1024
 	}
+	targetCellShare := cCap / (wCap + cCap)
+	if targetCellShare < 0.40 {
+		targetCellShare = 0.40
+	} else if targetCellShare > 0.75 {
+		targetCellShare = 0.75
+	}
+	targetWiFiShare := 1.0 - targetCellShare
 
-	ectWiFi := s.EstimatedCompletionTime(LinkWiFi, expectedBytes)
-	ectCell := s.EstimatedCompletionTime(LinkCellular, expectedBytes)
+	// 1. Active Flow-Ratio Enforcement: if Cellular has fewer than its target share
+	// of active flows (or 0 flows while Wi-Fi is active), pin this flow to Cellular
+	// with a 320 ms failover window so 5G NR wakes up and completes the handshake!
+	totalFlows := wStats.ActiveFlows + cStats.ActiveFlows
+	actualCellShare := float64(cStats.ActiveFlows) / float64(totalFlows+1)
 
-	// Inverse completion time weights -> proportional bandwidth water-filling.
-	invW := 1.0 / math.Max(ectWiFi, 0.001)
-	invC := 1.0 / math.Max(ectCell, 0.001)
-	sumInv := invW + invC
-	shareW := invW / sumInv
-	shareC := invC / sumInv
-
-	s.wifi.mu.Lock()
-	s.wifi.deficitCredit += shareW
-	wCredit := s.wifi.deficitCredit
-	s.wifi.mu.Unlock()
-
-	s.cellular.mu.Lock()
-	s.cellular.deficitCredit += shareC
-	cCredit := s.cellular.deficitCredit
-	s.cellular.mu.Unlock()
-
-	if cCredit >= wCredit {
-		s.cellular.mu.Lock()
-		s.cellular.deficitCredit -= 1.0
-		s.cellular.mu.Unlock()
+	if (cStats.ActiveFlows == 0 && wStats.ActiveFlows >= 1) ||
+		(actualCellShare < targetCellShare) ||
+		(seq%2 == 0 && cStats.ActiveFlows <= wStats.ActiveFlows) {
 		primary, secondary = LinkCellular, LinkWiFi
-	} else {
-		s.wifi.mu.Lock()
-		s.wifi.deficitCredit -= 1.0
-		s.wifi.mu.Unlock()
+	} else if wStats.ActiveFlows == 0 && cStats.ActiveFlows >= 1 {
 		primary, secondary = LinkWiFi, LinkCellular
+	} else {
+		// 2. Bounded Deficit Inverse-Completion-Time Water-Filling.
+		ectWiFi := s.EstimatedCompletionTime(LinkWiFi, expectedBytes)
+		ectCell := s.EstimatedCompletionTime(LinkCellular, expectedBytes)
+
+		invW := (1.0 / math.Max(ectWiFi, 0.001)) * targetWiFiShare
+		invC := (1.0 / math.Max(ectCell, 0.001)) * targetCellShare
+		sumInv := invW + invC
+		shareW := invW / sumInv
+		shareC := invC / sumInv
+
+		s.wifi.mu.Lock()
+		s.wifi.deficitCredit = clampFloat(s.wifi.deficitCredit+shareW, -1.5, 1.5)
+		wCredit := s.wifi.deficitCredit
+		s.wifi.mu.Unlock()
+
+		s.cellular.mu.Lock()
+		s.cellular.deficitCredit = clampFloat(s.cellular.deficitCredit+shareC, -1.5, 1.5)
+		cCredit := s.cellular.deficitCredit
+		s.cellular.mu.Unlock()
+
+		if cCredit >= wCredit {
+			s.cellular.mu.Lock()
+			s.cellular.deficitCredit -= 1.0
+			s.cellular.mu.Unlock()
+			primary, secondary = LinkCellular, LinkWiFi
+		} else {
+			s.wifi.mu.Lock()
+			s.wifi.deficitCredit -= 1.0
+			s.wifi.mu.Unlock()
+			primary, secondary = LinkWiFi, LinkCellular
+		}
 	}
 
-	// Dynamic head-start: tight stagger (15-45 ms) so both links race closely
-	// without wasting sockets when the primary connects instantaneously.
+	// Compute failover delay (`stagger`) for the chosen primary link.
+	// CRITICAL FIX: Cellular requires 260-340 ms before launching Wi-Fi failover
+	// so Wi-Fi never steals Cellular's assigned connections during 5G NR handshakes.
 	pStats := s.Stats(primary)
-	stagger = pStats.SRTT/2 + pStats.RTTVar
-	if stagger < 15*time.Millisecond {
-		stagger = 15 * time.Millisecond
-	} else if stagger > 45*time.Millisecond {
-		stagger = 45 * time.Millisecond
+	stagger = pStats.SRTT + 3*pStats.RTTVar
+	if primary == LinkCellular {
+		minCellStagger := 260 * time.Millisecond
+		if cStats.ActiveFlows == 0 {
+			minCellStagger = 340 * time.Millisecond // Allow 5G RRC_INACTIVE -> RRC_CONNECTED wakeup
+		}
+		if stagger < minCellStagger {
+			stagger = minCellStagger
+		} else if stagger > 450*time.Millisecond {
+			stagger = 450 * time.Millisecond
+		}
+	} else {
+		if stagger < 140*time.Millisecond {
+			stagger = 140 * time.Millisecond
+		} else if stagger > 280*time.Millisecond {
+			stagger = 280 * time.Millisecond
+		}
 	}
 	return primary, secondary, stagger
 }
 
-// SplitBytes divides a byte range across Wi-Fi and Cellular proportional to their
-// real-time BDP and goodput so parallel HTTP Range requests finish simultaneously.
 func (s *Scheduler) SplitBytes(totalBytes int64) (wifiBytes int64, cellBytes int64) {
 	if totalBytes <= 0 {
 		return 0, 0
@@ -322,8 +356,10 @@ func (s *Scheduler) SplitBytes(totalBytes int64) (wifiBytes int64, cellBytes int
 	wStats := s.Stats(LinkWiFi)
 	cStats := s.Stats(LinkCellular)
 
-	wRate := math.Max(wStats.SmoothedBps, 256*1024)
-	cRate := math.Max(cStats.SmoothedBps, 256*1024)
+	wRate := math.Max(wStats.SmoothedBps, 0.5*wStats.PeakBps)
+	cRate := math.Max(cStats.SmoothedBps, 0.5*cStats.PeakBps)
+	wRate = math.Max(wRate, 512*1024)
+	cRate = math.Max(cRate, 512*1024)
 
 	if !wStats.Healthy && cStats.Healthy {
 		return 0, totalBytes
@@ -333,18 +369,27 @@ func (s *Scheduler) SplitBytes(totalBytes int64) (wifiBytes int64, cellBytes int
 	}
 
 	cellRatio := cRate / (wRate + cRate)
-	if cellRatio < 0.20 {
-		cellRatio = 0.20
-	} else if cellRatio > 0.85 {
-		cellRatio = 0.85
+	if cellRatio < 0.35 {
+		cellRatio = 0.35
+	} else if cellRatio > 0.75 {
+		cellRatio = 0.75
 	}
 
 	cellBytes = int64(float64(totalBytes) * cellRatio)
-	// Align split boundary to 4 KB pages.
 	const align = 4096
 	if cellBytes > align {
 		cellBytes = (cellBytes / align) * align
 	}
 	wifiBytes = totalBytes - cellBytes
 	return wifiBytes, cellBytes
+}
+
+func clampFloat(v, minV, maxV float64) float64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
 }

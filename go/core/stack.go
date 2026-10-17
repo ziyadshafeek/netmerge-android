@@ -381,6 +381,14 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 		return false
 	}
 
+	// WebRTC STUN/TURN leak blocker: binding requests on STUN ports would expose
+	// the real Wi-Fi/Cellular IPs to the website. Drop them here so WebRTC falls
+	// back to TURN over TCP/443, which the multipath engine compounds.
+	// (Port-based: the datagram payload isn't visible before CreateEndpoint.)
+	if multipath.IsSTUNOrDiscoveryLeak(nil, dstPort) {
+		return false
+	}
+
 	key := udpKey(f, id)
 
 	e.udpMu.Lock()

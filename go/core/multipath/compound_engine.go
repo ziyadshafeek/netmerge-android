@@ -100,14 +100,16 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 	defer cancel()
 
 	// Preferred link from the BDP-aware multipath scheduler (deficit
-	// inverse-completion-time water-filling). The speculative dual-dial still
-	// races both radios; the preference only biases its 45ms grace window,
-	// so a wrong pick costs nothing.
+	// inverse-completion-time water-filling with active flow-ratio pinning).
+	// The returned stagger delays the non-preferred dial so a cellular-primary
+	// assignment survives 5G NR RRC wakeup instead of losing the race to Wi-Fi's
+	// shorter RTT on every flow.
 	var preferred LinkType
+	var stagger time.Duration
 	if e.MPSched != nil {
-		preferred, _, _ = e.MPSched.SelectLinks(256 * 1024)
+		preferred, _, stagger = e.MPSched.SelectLinks(256 * 1024)
 	}
-	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, preferred)
+	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, preferred, stagger)
 	if err != nil {
 		return err
 	}
@@ -308,7 +310,7 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	probeConn, _, standbyCh, err := DialSpeculativeDualLink(probeCtx, e.Binder, ep, port, 0)
+	probeConn, _, standbyCh, err := DialSpeculativeDualLink(probeCtx, e.Binder, ep, port, 0, 0)
 	if err != nil {
 		return err
 	}

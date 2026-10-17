@@ -203,16 +203,19 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 	return c, err
 }
 
-// DialSpeculativeDualLink dials BOTH Wi-Fi and Cellular at t=0ms (zero artificial delay!).
-// It gives the preferred link (chosen by the Rolling Byte-Credit Scheduler) a tiny 35ms
-// grace window if the non-preferred link finishes its TCP handshake first, and recycles
-// the unused standby connection into warmPool so the next parallel stream gets a 0ms connect!
+// DialSpeculativeDualLink dials Wi-Fi and Cellular for a new flow. When stagger > 0
+// and a preferred link is assigned, the NON-preferred dial is delayed by stagger so the
+// preferred link (usually Cellular, which needs 260-340ms for 5G NR RRC wakeup + handshake)
+// cannot be hijacked by Wi-Fi's shorter RTT. If the preferred dial fails fast, the delayed
+// dial starts immediately (failover is never slower than the failure). The preferred link
+// also keeps its 45ms grace window when both dial immediately (stagger == 0).
 func DialSpeculativeDualLink(
 	ctx context.Context,
 	binder SocketBinder,
 	ep *DualEndpoint,
 	port string,
 	preferred LinkType,
+	stagger time.Duration,
 ) (winner net.Conn, winnerLink LinkType, standbyCh <-chan raceResult, err error) {
 	if preferred == 0 {
 		preferred = StripedPreferredLink()
@@ -221,17 +224,49 @@ func DialSpeculativeDualLink(
 	wifiAddr, cellAddr := ep.WaitReady(ctx)
 	ch := make(chan raceResult, 2)
 
+	// Closed when the preferred link's dial FAILS, so a staggered non-preferred
+	// dial can start failover immediately instead of waiting out the stagger.
+	prefFailed := make(chan struct{})
+	var prefFailedOnce sync.Once
+
+	n := 0
+	if wifiAddr != "" {
+		n++
+	}
+	if cellAddr != "" {
+		n++
+	}
+	// Only stagger when both radios are actually dialing; with a single link the
+	// delay would just add latency for nothing.
+	doStagger := stagger > 0 && preferred != 0 && n == 2
+
 	dialOne := func(link LinkType, ip, otherIP string) {
 		if ip == "" {
+			if link == preferred {
+				prefFailedOnce.Do(func() { close(prefFailed) })
+			}
 			ch <- raceResult{link: link, err: errNoAddr}
 			return
 		}
+		if doStagger && link != preferred {
+			select {
+			case <-ctx.Done():
+				ch <- raceResult{link: link, err: ctx.Err()}
+				return
+			case <-prefFailed:
+				// Preferred link failed fast; start failover now.
+			case <-time.After(stagger):
+			}
+		}
 		start := time.Now()
 		c, dErr := DialLinkConn(ctx, binder, link, ip, otherIP, port)
+		if dErr != nil && link == preferred {
+			prefFailedOnce.Do(func() { close(prefFailed) })
+		}
 		ch <- raceResult{conn: c, link: link, ip: ip, rtt: time.Since(start), err: dErr}
 	}
 
-	n := 0
+	n = 0
 	if wifiAddr != "" {
 		n++
 		go dialOne(LinkWiFi, wifiAddr, cellAddr)
@@ -308,7 +343,7 @@ func DialSpeculativeDualLink(
 
 func DialRace(ctx context.Context, binder SocketBinder, wifiAddr, cellAddr, port string) (net.Conn, LinkType, error) {
 	ep := &DualEndpoint{WiFiAddr: wifiAddr, CellAddr: cellAddr}
-	winner, link, standbyCh, err := DialSpeculativeDualLink(ctx, binder, ep, port, 0)
+	winner, link, standbyCh, err := DialSpeculativeDualLink(ctx, binder, ep, port, 0, 0)
 	if err != nil {
 		return nil, 0, err
 	}

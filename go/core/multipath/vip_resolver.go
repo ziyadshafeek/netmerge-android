@@ -48,13 +48,15 @@ func SynthesizeCarrierNAT64(ip4 net.IP) string {
 }
 
 type DualEndpoint struct {
-	Domain   string
-	mu       sync.RWMutex
-	WiFiAddr string
-	CellAddr string
-	Updated  time.Time
-	readyCh  chan struct{}
-	once     sync.Once
+	Domain     string
+	mu         sync.RWMutex
+	WiFiAddr   string
+	CellAddr   string
+	CellRawV4  string
+	Updated    time.Time
+	readyCh    chan struct{}
+	once       sync.Once
+	refreshing atomic.Bool
 }
 
 func (ep *DualEndpoint) markReady() {
@@ -98,18 +100,44 @@ type VIPResolver struct {
 	domToVIP map[string]*domainVIPRing
 	nextVIP  atomic.Uint32
 
-	binder  SocketBinder
-	resolve func(ctx context.Context, domain string) (string, string)
+	binder        SocketBinder
+	dohClientWiFi *http.Client
+	dohClientCell *http.Client
+	resolve       func(ctx context.Context, domain string) (string, string)
 }
 
 func NewVIPResolver(binder SocketBinder) *VIPResolver {
 	r := &VIPResolver{
-		vipToDom: make(map[uint32]*DualEndpoint),
-		domToVIP: make(map[string]*domainVIPRing),
-		binder:   binder,
+		vipToDom:      make(map[uint32]*DualEndpoint),
+		domToVIP:      make(map[string]*domainVIPRing),
+		binder:        binder,
+		dohClientWiFi: newBoundDoHClient(binder, LinkWiFi),
+		dohClientCell: newBoundDoHClient(binder, LinkCellular),
 	}
 	r.nextVIP.Store(firstVIP)
 	return r
+}
+
+// newBoundDoHClient creates a persistent HTTP/2 TLS 1.3 client strictly bound
+// to a single physical radio so DNS queries never leak file descriptors.
+func newBoundDoHClient(binder SocketBinder, link LinkType) *http.Client {
+	dialer := NewBoundDialer(binder, link, 1200*time.Millisecond)
+	tr := &http.Transport{
+		DialContext:         dialer.DialContext,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        8,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 900 * time.Millisecond,
+		TLSClientConfig: &tls.Config{
+			ServerName: "cloudflare-dns.com",
+			MinVersion: tls.VersionTLS13,
+		},
+	}
+	return &http.Client{
+		Transport: tr,
+		Timeout:   1100 * time.Millisecond,
+	}
 }
 
 func (r *VIPResolver) maybeDiscoverNAT64Prefix() {
@@ -119,7 +147,6 @@ func (r *VIPResolver) maybeDiscoverNAT64Prefix() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 		defer cancel()
-		// RFC 7050: ipv4only.arpa resolves to the carrier's NAT64 prefix on Cellular.
 		ips := r.lookupOnLink(ctx, "ipv4only.arpa", LinkCellular, true)
 		for _, ip := range ips {
 			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
@@ -145,7 +172,12 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 		pick := ring.vips[ring.idx.Add(1)%uint32(vipsPerDomain)]
 		w, c := ring.ep.Addrs()
 		if (w == "" || c == "") || time.Since(ring.ep.Updated) > 60*time.Second {
-			go r.populateEndpoint(ring.ep)
+			if ring.ep.refreshing.CompareAndSwap(false, true) {
+				go func(ep *DualEndpoint) {
+					defer ep.refreshing.Store(false)
+					r.populateEndpoint(ep)
+				}(ring.ep)
+			}
 		}
 		return vipFromInt(pick), ring.ep
 	}
@@ -191,10 +223,14 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 		Domain:  domain,
 		readyCh: make(chan struct{}),
 	}
+	ep.refreshing.Store(true)
 	ring := r.allocateRingLocked(domain, ep)
 	r.mu.Unlock()
 
-	go r.populateEndpoint(ep)
+	go func() {
+		defer ep.refreshing.Store(false)
+		r.populateEndpoint(ep)
+	}()
 	return vipFromInt(ring.vips[0]), ep
 }
 
@@ -228,8 +264,9 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	defer cancel()
 
 	type res struct {
-		link LinkType
-		addr string
+		link  LinkType
+		addr  string
+		rawV4 string
 	}
 	ch := make(chan res, 2)
 
@@ -249,42 +286,36 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		ch <- res{link: LinkWiFi, addr: addr}
 	}()
 
-	// Jio 5G Cellular resolution: prefers native IPv6 (AAAA) first; if target is IPv4-only,
-	// synthesizes RFC 7050 / RFC 6052 carrier NAT64 IPv6 so traffic bypasses slow CLAT.
+	// Cellular resolution: prefers native IPv6 (AAAA) first; retains raw IPv4 fallback
+	// so dual-stack or CLAT 5G bearers can try both native IPv6/NAT64 and IPv4 seamlessly.
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkCellular, true)
 		addr := ""
+		rawV4 := ""
 		for _, ip := range ips {
-			if ip.To4() == nil && ip.To16() != nil {
+			if v4 := ip.To4(); v4 != nil && rawV4 == "" {
+				rawV4 = v4.String()
+			}
+			if ip.To4() == nil && ip.To16() != nil && addr == "" {
 				addr = ip.String()
-				break
 			}
 		}
-		if addr == "" {
-			for _, ip := range ips {
-				if v4 := ip.To4(); v4 != nil {
-					if synth := SynthesizeCarrierNAT64(v4); synth != "" {
-						addr = synth
-					} else {
-						addr = v4.String()
-					}
-					break
-				}
-			}
+		if addr == "" && rawV4 != "" {
+			addr = rawV4
 		}
-		ch <- res{link: LinkCellular, addr: addr}
+		ch <- res{link: LinkCellular, addr: addr, rawV4: rawV4}
 	}()
 
-	var wAddr, cAddr string
+	var wAddr, cAddr, cRawV4 string
 	first := <-ch
 	if first.link == LinkWiFi {
 		wAddr = first.addr
 	} else {
 		cAddr = first.addr
+		cRawV4 = first.rawV4
 	}
 
-	// Wait up to 65 ms for the second link before marking ready so Wi-Fi never overwrites CellAddr prematurely.
-	graceTimer := time.NewTimer(65 * time.Millisecond)
+	graceTimer := time.NewTimer(75 * time.Millisecond)
 	select {
 	case second := <-ch:
 		graceTimer.Stop()
@@ -292,15 +323,15 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 			wAddr = second.addr
 		} else {
 			cAddr = second.addr
+			cRawV4 = second.rawV4
 		}
-		r.applyEndpointAddrs(ep, wAddr, cAddr)
+		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4)
 		return
 	case <-graceTimer.C:
 	}
 
-	// If the first link succeeded, commit provisionally and let the second link finish asynchronously.
 	if wAddr != "" || cAddr != "" {
-		r.applyEndpointAddrs(ep, wAddr, cAddr)
+		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4)
 		ep.markReady()
 	}
 
@@ -309,11 +340,12 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		wAddr = second.addr
 	} else {
 		cAddr = second.addr
+		cRawV4 = second.rawV4
 	}
-	r.applyEndpointAddrs(ep, wAddr, cAddr)
+	r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4)
 }
 
-func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c string) {
+func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 	if w != "" {
@@ -322,31 +354,30 @@ func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c string) {
 	if c != "" {
 		ep.CellAddr = c
 	}
+	if cRawV4 != "" {
+		ep.CellRawV4 = cRawV4
+	} else if parsed := net.ParseIP(ep.WiFiAddr); parsed != nil && parsed.To4() != nil {
+		ep.CellRawV4 = ep.WiFiAddr
+	}
 	if ep.WiFiAddr == "" && ep.CellAddr != "" {
-		ep.WiFiAddr = ep.CellAddr
+		if ep.CellRawV4 != "" {
+			ep.WiFiAddr = ep.CellRawV4
+		} else {
+			ep.WiFiAddr = ep.CellAddr
+		}
 	}
 	if ep.CellAddr == "" && ep.WiFiAddr != "" {
-		if parsed := net.ParseIP(ep.WiFiAddr); parsed != nil && parsed.To4() != nil {
-			if synth := SynthesizeCarrierNAT64(parsed); synth != "" {
-				ep.CellAddr = synth
-			} else {
-				ep.CellAddr = ep.WiFiAddr
-			}
-		} else {
-			ep.CellAddr = ep.WiFiAddr
-		}
+		ep.CellAddr = ep.WiFiAddr
 	}
 	if ep.WiFiAddr != "" || ep.CellAddr != "" {
 		ep.Updated = time.Now()
 	}
 }
 
-// lookupOnLink races Encrypted DNS-over-HTTPS (DoH with RFC 8484 wireformat) and UDP DNS
-// directly over the bound physical interface so neither ISP can log or poison DNS queries.
 func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link LinkType, preferV6 bool) []net.IP {
 	qtypes := []uint16{1, 28} // A, AAAA
 	if preferV6 {
-		qtypes = []uint16{28, 1} // AAAA first on Jio 5G
+		qtypes = []uint16{28, 1} // AAAA first on 5G
 	}
 
 	type dnsOut struct {
@@ -355,7 +386,7 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 	}
 	outCh := make(chan dnsOut, 4)
 
-	// 1. Encrypted DoH query over bound link (Cloudflare IPv4 & IPv6 literals, zero bootstrap leak).
+	// 1. Encrypted DoH over persistent bound HTTP/2 client (zero FD leak).
 	go func() {
 		ips := r.queryDoHOnLink(ctx, domain, qtypes[0], link)
 		if len(ips) > 0 {
@@ -363,7 +394,7 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 		}
 	}()
 
-	// 2. Parallel UDP race fallback across primary and secondary resolvers on the bound link.
+	// 2. Parallel UDP race across primary & secondary DNS resolvers on bound link.
 	for idx, qt := range qtypes {
 		go func(qtype uint16, prio int) {
 			ips := r.queryUDPOnLink(ctx, domain, qtype, link)
@@ -401,24 +432,13 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		return nil
 	}
 	dohURL := "https://1.1.1.1/dns-query"
+	client := r.dohClientWiFi
 	if link == LinkCellular {
-		// Direct IPv6 DoH endpoint for Jio 5G.
 		dohURL = "https://[2606:4700:4700::1111]/dns-query"
+		client = r.dohClientCell
 	}
-
-	dialer := NewBoundDialer(r.binder, link, 700*time.Millisecond)
-	tr := &http.Transport{
-		DialContext:       dialer.DialContext,
-		ForceAttemptHTTP2: true,
-		TLSClientConfig: &tls.Config{
-			ServerName: "cloudflare-dns.com",
-			MinVersion: tls.VersionTLS13,
-		},
-		DisableKeepAlives: false,
-	}
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   750 * time.Millisecond,
+	if client == nil {
+		return nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL, bytes.NewReader(wireReq))
@@ -429,6 +449,15 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 	req.Header.Set("Accept", "application/dns-message")
 
 	resp, err := client.Do(req)
+	if err != nil && link == LinkCellular {
+		// Fallback to IPv4 DoH endpoint on Cellular if carrier uses CLAT/IPv4.
+		reqV4, errReq := http.NewRequestWithContext(ctx, http.MethodPost, "https://1.1.1.1/dns-query", bytes.NewReader(wireReq))
+		if errReq == nil {
+			reqV4.Header.Set("Content-Type", "application/dns-message")
+			reqV4.Header.Set("Accept", "application/dns-message")
+			resp, err = client.Do(reqV4)
+		}
+	}
 	if err != nil {
 		return nil
 	}
@@ -450,7 +479,7 @@ func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype u
 	}
 	servers := []string{"1.1.1.1:53", "8.8.8.8:53"}
 	if link == LinkCellular {
-		servers = []string{"[2606:4700:4700::1111]:53", "[2001:4860:4860::8888]:53", "1.1.1.1:53"}
+		servers = []string{"[2606:4700:4700::1111]:53", "1.1.1.1:53", "[2001:4860:4860::8888]:53"}
 	}
 
 	dialer := NewBoundDialer(r.binder, link, 550*time.Millisecond)
@@ -478,8 +507,6 @@ func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype u
 	return nil
 }
 
-// buildDNSQueryPacket constructs an RFC 1035 DNS query with optional RFC 7830 EDNS0 random
-// block padding to defeat packet-size traffic analysis over TLS/HTTPS.
 func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uint16) {
 	var randBytes [2]byte
 	_, _ = rand.Read(randBytes[:])
@@ -511,18 +538,17 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 	buf.Write(qtail[:])
 
 	if padEDNS {
-		// EDNS0 OPT pseudo-RR with RFC 7830 padding option (code 12) to align block size to 128 bytes.
 		curLen := buf.Len() + 15
 		padLen := (128 - (curLen % 128)) % 128
-		buf.WriteByte(0) // Root name
+		buf.WriteByte(0)
 		var optHdr [10]byte
-		binary.BigEndian.PutUint16(optHdr[0:2], 41)   // Type OPT (41)
-		binary.BigEndian.PutUint16(optHdr[2:4], 1232) // UDP payload size
+		binary.BigEndian.PutUint16(optHdr[0:2], 41)
+		binary.BigEndian.PutUint16(optHdr[2:4], 1232)
 		binary.BigEndian.PutUint16(optHdr[8:10], uint16(4+padLen))
 		buf.Write(optHdr[:])
 
 		var padOpt [4]byte
-		binary.BigEndian.PutUint16(padOpt[0:2], 12) // Option Code 12 = Padding
+		binary.BigEndian.PutUint16(padOpt[0:2], 12)
 		binary.BigEndian.PutUint16(padOpt[2:4], uint16(padLen))
 		buf.Write(padOpt[:])
 		if padLen > 0 {

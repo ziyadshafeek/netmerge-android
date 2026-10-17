@@ -21,12 +21,13 @@ const (
 	socketBufSize = 4 * 1024 * 1024
 
 	// Linux/Android TCP socket options for low-latency congestion window ramp-up.
-	tcpQuickAck = 0xc  // TCP_QUICKACK
-	tcpMaxSeg   = 0x2  // TCP_MAXSEG
-	ipTosDSCP   = 0x28 // Assured Forwarding AF11 / Low-Latency Throughput
-	cellSafeMSS = 1360 // Prevents 5G NR GTP-U + NAT64/464XLAT PMTU blackholes
-	wifiSafeMSS = 1440 // Safe MSS for PPPoE/Fiber Wi-Fi uplinks
-
+	tcpQuickAck   = 0xc  // TCP_QUICKACK
+	tcpMaxSeg     = 0x2  // TCP_MAXSEG
+	tcpWindowClmp = 0xa  // TCP_WINDOW_CLAMP
+	ipTosDSCP     = 0x28 // Assured Forwarding AF11 / Low-Latency Throughput
+	ipv6TClass    = 0x43 // IPV6_TCLASS
+	cellSafeMSS   = 1360 // Prevents 5G NR GTP-U + NAT64/464XLAT PMTU blackholes
+	wifiSafeMSS   = 1440 // Safe MSS for PPPoE/Fiber Wi-Fi uplinks
 	spliceBufSize = 256 * 1024
 )
 
@@ -62,13 +63,25 @@ func NewBoundDialer(binder SocketBinder, link LinkType, timeout time.Duration) *
 				}
 				rawFD := int(fd)
 				// Tune kernel socket buffers before SYN so TCP window scale factor is maximized.
-				_ = syscall.SetsockoptInt(rawFD, syscall.SOL_SOCKET, syscall.SO_RCVBUF, socketBufSize)
-				_ = syscall.SetsockoptInt(rawFD, syscall.SOL_SOCKET, syscall.SO_SNDBUF, socketBufSize)
+				// Fall back through 4MB -> 2MB -> 1MB (unprivileged sockets may be
+				// clamped by net.core.rmem_max/wmem_max).
+				for _, sz := range []int{socketBufSize, 2 * 1024 * 1024, 1024 * 1024} {
+					if syscall.SetsockoptInt(rawFD, syscall.SOL_SOCKET, syscall.SO_RCVBUF, sz) == nil {
+						break
+					}
+				}
+				for _, sz := range []int{socketBufSize, 2 * 1024 * 1024, 1024 * 1024} {
+					if syscall.SetsockoptInt(rawFD, syscall.SOL_SOCKET, syscall.SO_SNDBUF, sz) == nil {
+						break
+					}
+				}
 				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IP, syscall.IP_TOS, ipTosDSCP)
+				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IPV6, ipv6TClass, ipTosDSCP)
 
 				if network == "tcp" || network == "tcp4" || network == "tcp6" {
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpQuickAck, 1)
+					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpWindowClmp, socketBufSize)
 					if link == LinkCellular {
 						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, cellSafeMSS)
 					} else {
@@ -100,24 +113,30 @@ func ReArmQuickAck(conn net.Conn) {
 }
 
 // MeteredConn wraps a net.Conn to report exact RX/TX byte counts to SocketBinder
-// and Scheduler without locks on the hot path.
+// and Scheduler without locks on the hot path, while applying first-packet TLS SNI
+// fragmentation for DPI privacy.
 type MeteredConn struct {
 	net.Conn
-	binder    SocketBinder
-	sched     *Scheduler
-	link      LinkType
-	rxTotal   atomic.Int64
-	txTotal   atomic.Int64
-	closeOnce sync.Once
+	binder      SocketBinder
+	sched       *Scheduler
+	link        LinkType
+	rxTotal     atomic.Int64
+	txTotal     atomic.Int64
+	firstWrite  atomic.Bool
+	fragmentTLS bool
+	closeOnce   sync.Once
 }
 
 func NewMeteredConn(c net.Conn, binder SocketBinder, sched *Scheduler, link LinkType) *MeteredConn {
-	return &MeteredConn{
-		Conn:   c,
-		binder: binder,
-		sched:  sched,
-		link:   link,
+	mc := &MeteredConn{
+		Conn:        c,
+		binder:      binder,
+		sched:       sched,
+		link:        link,
+		fragmentTLS: GlobalPrivacy.TLSFragmentationEnabled(),
 	}
+	mc.firstWrite.Store(true)
+	return mc
 }
 
 func (m *MeteredConn) Link() LinkType {
@@ -142,7 +161,15 @@ func (m *MeteredConn) Read(b []byte) (int, error) {
 
 func (m *MeteredConn) Write(b []byte) (int, error) {
 	start := time.Now()
-	n, err := m.Conn.Write(b)
+	var (
+		n   int
+		err error
+	)
+	if m.firstWrite.CompareAndSwap(true, false) && m.fragmentTLS && isTLSClientHello(b) {
+		n, err = writeFragmentedClientHello(m.Conn, b)
+	} else {
+		n, err = m.Conn.Write(b)
+	}
 	if n > 0 {
 		m.txTotal.Add(int64(n))
 		if m.binder != nil {
