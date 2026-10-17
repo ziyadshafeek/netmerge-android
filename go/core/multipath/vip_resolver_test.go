@@ -36,9 +36,10 @@ func TestVIPAllocationIncrements(t *testing.T) {
 	if ip1.Equal(ip2) {
 		t.Fatalf("distinct domains got same VIP %v", ip1)
 	}
-	// Counter starts at 0xC6120001; first Add(1) -> ...02, then ...03.
-	if ip1.String() != "198.18.0.2" || ip2.String() != "198.18.0.3" {
-		t.Fatalf("expected 198.18.0.2, 198.18.0.3; got %v, %v", ip1, ip2)
+	// Counter starts at 0xC6120001; each domain allocates a ring of 4 VIPs.
+	// a.example -> .2,.3,.4,.5 (returns .2); b.example -> .6,.7,.8,.9 (returns .6).
+	if ip1.String() != "198.18.0.2" || ip2.String() != "198.18.0.6" {
+		t.Fatalf("expected 198.18.0.2, 198.18.0.6; got %v, %v", ip1, ip2)
 	}
 }
 
@@ -105,10 +106,24 @@ func TestConcurrentAllocationNoDuplicates(t *testing.T) {
 	}
 	wg.Wait()
 
-	for i := 1; i < workers; i++ {
-		if !results[0].Equal(results[i]) {
-			t.Fatalf("concurrent callers got different VIPs: %v vs %v", results[0], results[i])
+	// Concurrent callers for the same domain rotate through its 4-VIP ring
+	// (anti-coalescing), but every VIP must resolve to the SAME endpoint.
+	wantEP := r.EndpointForVIP(results[0])
+	if wantEP == nil || wantEP.Domain != "race.example" {
+		t.Fatalf("EndpointForVIP(%v) = %+v, want race.example", results[0], wantEP)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < workers; i++ {
+		if results[i] == nil || !inBenchmarkNet(results[i]) {
+			t.Fatalf("worker %d got bad VIP %v", i, results[i])
 		}
+		if got := r.EndpointForVIP(results[i]); got != wantEP {
+			t.Fatalf("worker %d VIP %v resolved to %+v, want same endpoint", i, results[i], got)
+		}
+		seen[results[i].String()] = true
+	}
+	if len(seen) > 4 {
+		t.Fatalf("expected at most 4 alias VIPs in ring, got %d: %v", len(seen), seen)
 	}
 
 	// 1 shared + 8 distinct domains => exactly 9 VIPs allocated.
