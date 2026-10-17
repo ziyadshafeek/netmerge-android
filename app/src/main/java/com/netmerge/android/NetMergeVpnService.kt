@@ -249,13 +249,36 @@ class NetMergeVpnService : VpnService() {
             val arr = JSONArray()
             // Canonical slot IDs: "wifi" and "cellular". Never use Android's
             // churning netId — Go keys slots by this ID, so duplicates vanish.
-            wifiNetwork?.let { network ->
-                val info = networkInfoJson(cm, network, "wifi", "Wi-Fi", "WIFI")
-                if (info != null) arr.put(info)
+            //
+            // Prefer the requestNetwork-tracked refs (always fresh). But on
+            // cold start the callbacks haven't fired yet, so fall back to
+            // scanning cm.allNetworks to avoid sending an empty list (which
+            // would leave Go with no egress and blackhole all traffic).
+            var wifi = wifiNetwork
+            var cell = cellNetwork
+            if (wifi == null || cell == null) {
+                for (network in cm.allNetworks) {
+                    val caps = cm.getNetworkCapabilities(network) ?: continue
+                    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) == false) continue
+                    // Skip the VPN network itself (tun0).
+                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                    when {
+                        wifi == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
+                            wifi = network
+                            wifiNetwork = network
+                        }
+                        cell == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
+                            cell = network
+                            cellNetwork = network
+                        }
+                    }
+                }
             }
-            cellNetwork?.let { network ->
-                val info = networkInfoJson(cm, network, "cellular", "Mobile", "CELLULAR")
-                if (info != null) arr.put(info)
+            wifi?.let { network ->
+                networkInfoJson(cm, network, "wifi", "Wi-Fi", "WIFI")?.let { arr.put(it) }
+            }
+            cell?.let { network ->
+                networkInfoJson(cm, network, "cellular", "Mobile", "CELLULAR")?.let { arr.put(it) }
             }
             Core.updateNetworks(arr.toString())
         } catch (t: Throwable) {
