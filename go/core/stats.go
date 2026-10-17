@@ -35,10 +35,10 @@ func (e *Engine) statsJSON() string {
 		rx := sl.bytesOut[Fam4].Load() + sl.bytesOut[Fam6].Load()
 		ns := netStat{
 			ID: sl.ID, DisplayName: sl.DisplayName, Transport: sl.Transport,
-			State: sl.state[Fam4].String(),
+			State: combinedState(sl).String(),
 			TxBytes: tx, RxBytes: rx,
 			ActiveFlows: sl.active.Load(),
-			Weight:      round2(sl.weight[Fam4]),
+			Weight:      round2(combinedWeight(sl)),
 		}
 		p.Networks = append(p.Networks, ns)
 		p.Totals.TxBytes += tx
@@ -47,6 +47,54 @@ func (e *Engine) statsJSON() string {
 	}
 	b, _ := json.Marshal(p)
 	return string(b)
+}
+
+// combinedState reports the link's overall health across address families.
+// A family without an address is not probeable and doesn't count: on
+// IPv6-only carriers (e.g. Jio) the IPv4 state would otherwise sit at
+// "checking" forever and mask a perfectly healthy IPv6 path.
+func combinedState(sl *Slot) linkState {
+	anyProbed, anyUnknown := false, false
+	for _, f := range []Family{Fam4, Fam6} {
+		if sl.ip(f) == nil {
+			continue
+		}
+		anyProbed = true
+		switch sl.state[f] {
+		case stateUp:
+			return stateUp
+		case stateUnknown:
+			anyUnknown = true
+		}
+	}
+	if !anyProbed {
+		return stateUnknown
+	}
+	if anyUnknown {
+		return stateUnknown
+	}
+	return stateDown
+}
+
+// combinedWeight mirrors combinedState: prefer the weight of a family that
+// is up, otherwise the best known weight.
+func combinedWeight(sl *Slot) float64 {
+	best := 0.0
+	for _, f := range []Family{Fam4, Fam6} {
+		if sl.ip(f) == nil {
+			continue
+		}
+		if sl.state[f] == stateUp {
+			return sl.weight[f]
+		}
+		if sl.weight[f] > best {
+			best = sl.weight[f]
+		}
+	}
+	if best == 0 {
+		return 1.0
+	}
+	return best
 }
 
 // round2 keeps weights readable in the UI.
