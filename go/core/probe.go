@@ -71,7 +71,7 @@ func (e *Engine) runProbe(sl *Slot, f Family) {
 	ok := false
 	for _, t := range targets {
 		host, port := splitHostPort(t)
-		c, err := e.dialBound(sl, f, "tcp", host, port, probeTimeout)
+		c, err := e.dialPinned(sl, f, "tcp", host, port, probeTimeout)
 		if err == nil {
 			c.Close()
 			ok = true

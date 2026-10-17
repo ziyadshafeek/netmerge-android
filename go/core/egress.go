@@ -52,9 +52,48 @@ var testDialRewrite map[string]string
 // dialBound opens a TCP or UDP socket pinned to sl's interface for the
 // given family. The source IP is also pinned (like net-merge) so the flow
 // cannot wander to another link even if routes change mid-dial.
+//
+// Fallback: if the pinned dial fails at the link level (some carriers /
+// 464XLAT setups break SO_BINDTOIFINDEX), retry with VPN protection only
+// and let the OS route normally. Single-link connectivity then works even
+// when pinning is broken; the scheduler still prefers pinned links.
+//
+// NOTE: probes must use dialPinned (below), not this: a fallback success
+// via the default route would falsely mark a broken link as up.
 func (e *Engine) dialBound(sl *Slot, f Family, proto, host string, port int, timeout time.Duration) (net.Conn, error) {
+	c, err := e.dialPinned(sl, f, proto, host, port, timeout)
+	if err == nil || !isLinkDown(err) {
+		return c, err
+	}
+	return e.dialWith(sl, f, proto, host, port, timeout, false)
+}
+
+// dialPinned is dialBound without the unpinned fallback: for probes, where
+// a fallback success must not masquerade as link health.
+func (e *Engine) dialPinned(sl *Slot, f Family, proto, host string, port int, timeout time.Duration) (net.Conn, error) {
+	return e.dialWith(sl, f, proto, host, port, timeout, true)
+}
+
+// protectOnlyControl returns a Dialer Control func that protects the socket
+// from the VPN without pinning it to any interface.
+func (e *Engine) protectOnlyControl() func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		if e.protector == nil {
+			return nil
+		}
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			e.protector.Protect(int(fd))
+		}); err != nil {
+			return err
+		}
+		return serr
+	}
+}
+
+func (e *Engine) dialWith(sl *Slot, f Family, proto, host string, port int, timeout time.Duration, pin bool) (net.Conn, error) {
 	ip := sl.ip(f)
-	if ip == nil {
+	if pin && ip == nil {
 		return nil, &linkError{err: errors.New("network has no address for this family"), down: true}
 	}
 	if testDialRewrite != nil {
@@ -67,16 +106,22 @@ func (e *Engine) dialBound(sl *Slot, f Family, proto, host string, port int, tim
 		network = proto + "6"
 	}
 	var local net.Addr
-	if proto == "tcp" {
-		local = &net.TCPAddr{IP: ip}
+	var control func(network, address string, c syscall.RawConn) error
+	if pin {
+		if proto == "tcp" {
+			local = &net.TCPAddr{IP: ip}
+		} else {
+			local = &net.UDPAddr{IP: ip}
+		}
+		control = e.egressControl(sl)
 	} else {
-		local = &net.UDPAddr{IP: ip}
+		control = e.protectOnlyControl()
 	}
 	d := net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
 		LocalAddr: local,
-		Control:   e.egressControl(sl),
+		Control:   control,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
