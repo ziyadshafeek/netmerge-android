@@ -1,0 +1,503 @@
+package core
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
+)
+
+const (
+	nicID        = 1
+	tunMTU       = 9000
+	dialTimeout  = 10 * time.Second
+	failCooldown = 15 * time.Second
+)
+
+// udpIdleTimeout is how long a UDP session may go without traffic in
+// either direction before it is closed. udpPollInterval is how often the
+// relay loops wake up to re-check idleness. Vars (not consts) so tests can
+// shrink them.
+var (
+	udpIdleTimeout  = 60 * time.Second
+	udpPollInterval = 10 * time.Second
+)
+
+type config struct {
+	weights map[string]float64
+}
+
+func parseConfig(js string) (config, error) {
+	c := config{weights: map[string]float64{}}
+	if js == "" {
+		return c, nil
+	}
+	var raw struct {
+		Weights map[string]float64 `json:"weights"`
+	}
+	if err := json.Unmarshal([]byte(js), &raw); err != nil {
+		return c, err
+	}
+	for k, v := range raw.Weights {
+		if v > 0 {
+			c.weights[k] = v
+		}
+	}
+	return c, nil
+}
+
+// Engine is the running data plane: netstack + scheduler + probers.
+type Engine struct {
+	stack     *stack.Stack
+	linkEp    stack.LinkEndpoint
+	scheduler *Scheduler
+	protector Protector
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
+
+	udpMu       sync.Mutex
+	udpSessions map[string]*udpSession
+}
+
+func newEngine(tunFd int, protector Protector, cfg config) (*Engine, error) {
+	// The link endpoint reads/writes raw IP packets on the TUN fd.
+	// EthernetHeader=false because TUN is L3. New() makes the fd
+	// non-blocking but does NOT take ownership: Kotlin still owns tunFd
+	// and we must never close it.
+	linkEp, err := fdbased.New(&fdbased.Options{
+		FDs: []int{tunFd},
+		MTU: tunMTU,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tun link: %w", err)
+	}
+
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			// AllowExternalLoopbackTraffic: apps legitimately talk to
+			// 127.0.0.1 (local proxies, dev servers); the TUN is not a
+			// real LAN interface, so without this such SYNs are dropped
+			// as martians.
+			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
+			ipv6.NewProtocolWithOptions(ipv6.Options{}),
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			func(st *stack.Stack) stack.TransportProtocol { return tcp.NewProtocol(st) },
+			func(st *stack.Stack) stack.TransportProtocol { return udp.NewProtocol(st) },
+		},
+	})
+	if terr := s.CreateNIC(nicID, linkEp); terr != nil {
+		return nil, fmt.Errorf("create nic: %s", terr)
+	}
+	// Promiscuous so the stack accepts packets for *any* destination IP:
+	// we terminate everything the TUN captures, we don't route it.
+	if terr := s.SetPromiscuousMode(nicID, true); terr != nil {
+		return nil, fmt.Errorf("promiscuous: %s", terr)
+	}
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: nicID},
+		{Destination: header.IPv6EmptySubnet, NIC: nicID},
+	})
+
+	e := &Engine{
+		stack:       s,
+		linkEp:      linkEp,
+		scheduler:   newScheduler(cfg.weights),
+		protector:   protector,
+		stopCh:      make(chan struct{}),
+		udpSessions: map[string]*udpSession{},
+	}
+
+	tcpFwd := tcp.NewForwarder(s, 0, 4096, e.handleTCP)
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+	udpFwd := udp.NewForwarder(s, e.handleUDP)
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+
+	e.wg.Add(1)
+	go e.loop()
+	return e, nil
+}
+
+// loop is the single background goroutine: 1s tick drives weight sampling
+// and probe scheduling. One goroutine, no busy loops: battery-sane.
+func (e *Engine) loop() {
+	defer e.wg.Done()
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-t.C:
+			e.scheduler.Tick(time.Second)
+			for _, j := range e.probeDue() {
+				go e.runProbe(j.sl, j.f)
+			}
+		}
+	}
+}
+
+func (e *Engine) close() {
+	select {
+	case <-e.stopCh:
+		return
+	default:
+		close(e.stopCh)
+	}
+	e.wg.Wait()
+	// Drop UDP sessions.
+	e.udpMu.Lock()
+	for _, us := range e.udpSessions {
+		us.close()
+	}
+	e.udpSessions = map[string]*udpSession{}
+	e.udpMu.Unlock()
+	e.stack.Close()
+	// NOTE: linkEp/tunFd intentionally not closed: Kotlin owns the fd.
+}
+
+// familyOf maps a netstack address to its address family.
+func familyOf(addr tcpip.Address) Family {
+	if addr.Len() == 4 {
+		return Fam4
+	}
+	return Fam6
+}
+
+// tcpipToIP converts a netstack address to net.IP.
+func tcpipToIP(addr tcpip.Address) net.IP {
+	if addr.Len() == 4 {
+		b := addr.As4()
+		return net.IPv4(b[0], b[1], b[2], b[3])
+	}
+	b := addr.As16()
+	out := make(net.IP, 16)
+	copy(out, b[:])
+	return out
+}
+
+// ---- TCP ----
+
+// handleTCP runs for every new inbound TCP connection from the TUN.
+// ensureAddr registers addr as a permanent protocol address on the TUN NIC
+// so reply packets can be sourced from it. Safe to call concurrently;
+// duplicates are ignored.
+func (e *Engine) ensureAddr(addr tcpip.Address) {
+	proto := header.IPv4ProtocolNumber
+	if addr.Len() == 16 {
+		proto = header.IPv6ProtocolNumber
+	}
+	_ = e.stack.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol:          proto,
+		AddressWithPrefix: addr.WithPrefix(),
+	}, stack.AddressProperties{PEB: stack.CanBePrimaryEndpoint})
+}
+
+func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
+	defer func() { _ = recover() }()
+	id := r.ID()
+	// Ensure the destination address is registered on the NIC so the
+	// stack can source reply packets from it. Promiscuous mode lets the
+	// inbound SYN through via a temporary address, but temporary
+	// addresses are not eligible as source addresses for the SYN-ACK;
+	// promoting to a permanent address fixes the return path.
+	// Duplicate adds are harmless (ErrDuplicateAddress is ignored).
+	e.ensureAddr(id.LocalAddress)
+	f := familyOf(id.LocalAddress)
+	host := tcpipToIP(id.LocalAddress).String()
+	port := int(id.LocalPort)
+
+	upstream, slot, err := e.dialTCP(f, host, port)
+	if err != nil {
+		r.Complete(true) // RST: no usable network
+		return
+	}
+	var wq waiter.Queue
+	ep, terr := r.CreateEndpoint(&wq)
+	if terr != nil {
+		upstream.Close()
+		e.scheduler.ReleaseFor(slot, f)
+		r.Complete(true)
+		return
+	}
+	r.Complete(false)
+	tunConn := gonet.NewTCPConn(&wq, ep)
+	e.relayTCP(tunConn, upstream, slot, f)
+}
+
+// dialTCP connects to host:port through the scheduler, failing over to
+// other networks on link-level errors. On success the caller owns the slot
+// and must relay or release it.
+func (e *Engine) dialTCP(f Family, host string, port int) (net.Conn, *Slot, error) {
+	tried := map[string]struct{}{}
+	var lastErr error = fmt.Errorf("no usable network")
+	for {
+		sl := e.scheduler.AcquireFor(f, tried)
+		if sl == nil {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("no usable network")
+			}
+			return nil, nil, lastErr
+		}
+		tried[sl.ID] = struct{}{}
+		c, err := e.dialBound(sl, f, "tcp", host, port, dialTimeout)
+		if err == nil {
+			return c, sl, nil
+		}
+		e.scheduler.ReleaseFor(sl, f)
+		lastErr = err
+		if isLinkDown(err) {
+			e.scheduler.Fail(sl, f, failCooldown)
+			continue // try the next network
+		}
+		return nil, nil, err // destination refused etc: don't flap networks
+	}
+}
+
+// ---- UDP ----
+
+type udpSession struct {
+	key      string
+	tunConn  net.PacketConn // *gonet.UDPConn in production; stubbed in tests
+	upstream net.Conn
+	slot     *Slot
+	family   Family
+	lastAct  atomic.Int64 // unix nanos of last datagram either way
+	closed   atomic.Bool
+	closeCh  chan struct{}
+}
+
+func (us *udpSession) touch() { us.lastAct.Store(time.Now().UnixNano()) }
+func (us *udpSession) idle() time.Duration {
+	return time.Since(time.Unix(0, us.lastAct.Load()))
+}
+func (us *udpSession) close() {
+	if us.closed.CompareAndSwap(false, true) {
+		close(us.closeCh)
+		us.tunConn.Close()
+		us.upstream.Close()
+	}
+}
+
+// udpKey is the 5-tuple identifying a UDP session.
+func udpKey(f Family, id stack.TransportEndpointID) string {
+	return "udp/" + tcpipToIP(id.RemoteAddress).String() + ":" +
+		strconv.Itoa(int(id.RemotePort)) + "->" + tcpipToIP(id.LocalAddress).String() + ":" +
+		strconv.Itoa(int(id.LocalPort))
+}
+
+// handleUDP runs for the first datagram of each new 5-tuple. Later
+// datagrams are delivered straight to the session's endpoint.
+func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
+	defer func() { _ = recover() }()
+	id := r.ID()
+	// See handleTCP: ensure the destination is a usable source address
+	// for replies.
+	e.ensureAddr(id.LocalAddress)
+	f := familyOf(id.LocalAddress)
+	key := udpKey(f, id)
+
+	e.udpMu.Lock()
+	if _, dup := e.udpSessions[key]; dup {
+		e.udpMu.Unlock()
+		return true // racing datagram; the live session owns it
+	}
+	e.udpMu.Unlock()
+
+	dstHost, dstPort := tcpipToIP(id.LocalAddress).String(), int(id.LocalPort)
+
+	// Pick the network BEFORE dialing: DNS needs the slot's DNS server.
+	sl := e.scheduler.AcquireFor(f, nil)
+	if sl == nil {
+		return false // ICMP port unreachable; nothing can carry it
+	}
+	if dstPort == 53 {
+		if dns := e.dnsServerFor(sl, f); dns != nil {
+			dstHost = dns.String() // dns.go: keep DNS on the right link
+		}
+	}
+
+	upstream, err := e.dialBoundUDP(sl, f, dstHost, dstPort)
+	if err != nil {
+		e.scheduler.ReleaseFor(sl, f)
+		if isLinkDown(err) {
+			e.scheduler.Fail(sl, f, failCooldown)
+		}
+		return false
+	}
+
+	var wq waiter.Queue
+	ep, terr := r.CreateEndpoint(&wq)
+	if terr != nil {
+		upstream.Close()
+		e.scheduler.ReleaseFor(sl, f)
+		return false
+	}
+	tunConn := gonet.NewUDPConn(&wq, ep)
+
+	us := &udpSession{
+		key: key, tunConn: tunConn, upstream: upstream,
+		slot: sl, family: f, closeCh: make(chan struct{}),
+	}
+	us.touch()
+	e.udpMu.Lock()
+	e.udpSessions[key] = us
+	e.udpMu.Unlock()
+
+	clientAddr := &net.UDPAddr{IP: tcpipToIP(id.RemoteAddress), Port: int(id.RemotePort)}
+	go e.relayUDP(us, clientAddr)
+	return true
+}
+
+// relayUDP shuttles datagrams between the TUN side and the upstream socket
+// until the session idles out (60s without traffic either way) or errors.
+func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
+	defer func() { _ = recover() }()
+	defer e.dropUDPSession(us)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // TUN -> upstream
+		defer wg.Done()
+		buf := bufPool.Get().(*[]byte)
+		defer bufPool.Put(buf)
+		for {
+			us.tunConn.SetReadDeadline(time.Now().Add(udpPollInterval))
+			n, _, err := us.tunConn.ReadFrom((*buf)[:cap(*buf)])
+			if err != nil {
+				if isTimeout(err) && us.idle() < udpIdleTimeout {
+					continue // one-sided quiet spell, not idle yet
+				}
+				return
+			}
+			us.touch()
+			us.slot.bytesIn[us.family].Add(int64(n))
+			if _, err := us.upstream.Write((*buf)[:n]); err != nil {
+				return
+			}
+		}
+	}()
+	// upstream -> TUN (runs on this goroutine)
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
+	for {
+		us.upstream.SetReadDeadline(time.Now().Add(udpPollInterval))
+		n, err := us.upstream.Read((*buf)[:cap(*buf)])
+		if err != nil {
+			if isTimeout(err) && us.idle() < udpIdleTimeout {
+				continue
+			}
+			return
+		}
+		us.touch()
+		us.slot.bytesOut[us.family].Add(int64(n))
+		if _, err := us.tunConn.WriteTo((*buf)[:n], clientAddr); err != nil {
+			return
+		}
+	}
+}
+
+func (e *Engine) dropUDPSession(us *udpSession) {
+	e.udpMu.Lock()
+	if cur, ok := e.udpSessions[us.key]; ok && cur == us {
+		delete(e.udpSessions, us.key)
+	}
+	e.udpMu.Unlock()
+	us.close()
+	e.scheduler.ReleaseFor(us.slot, us.family)
+}
+
+// ---- relay ----
+
+var bufPool = sync.Pool{New: func() any { b := make([]byte, 128<<10); return &b }}
+
+// relayTCP copies both directions until both sides finish, counting bytes
+// per network/family, then closes both conns and releases the slot.
+// Half-close is honoured so request/response protocols that shut down
+// their write side still receive the reply.
+func (e *Engine) relayTCP(client, upstream net.Conn, sl *Slot, f Family) {
+	var wg sync.WaitGroup
+	var once sync.Once
+	release := func() { once.Do(func() { e.scheduler.ReleaseFor(sl, f) }) }
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pump(upstream, client, &sl.bytesOut[f])
+		release()
+	}()
+	pump(client, upstream, &sl.bytesIn[f])
+	release()
+	wg.Wait()
+	client.Close()
+	upstream.Close()
+}
+
+func pump(dst, src net.Conn, counter *atomic.Int64) {
+	bp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bp)
+	buf := *bp
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			counter.Add(int64(n))
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				dst.Close()
+				src.Close()
+				return
+			}
+		}
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			closeWrite(dst, src, err)
+			return
+		}
+	}
+}
+
+func closeWrite(dst, src net.Conn, rerr error) {
+	// EOF (io.EOF or a closed connection): half-close the destination so
+	// the other direction can still deliver its reply.
+	if rerr != nil && (isEOF(rerr)) {
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+			return
+		}
+	}
+	dst.Close()
+	src.Close()
+}
+
+func isEOF(err error) bool {
+	if err == nil {
+		return false
+	}
+	// gonet returns io.EOF; raw conns surface EPIPE/ECONNRESET when the
+	// peer is gone, which is also "done reading".
+	return errors.Is(err, io.EOF) ||
+		err == syscall.EPIPE || err == syscall.ECONNRESET
+}
+
+func isTimeout(err error) bool {
+	ne, ok := err.(net.Error)
+	return ok && ne.Timeout()
+}
