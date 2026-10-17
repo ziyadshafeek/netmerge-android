@@ -95,7 +95,7 @@ class NetMergeVpnService : VpnService() {
                 .addRoute("::", 1)
                 .addRoute("8000::", 1)
                 .addDnsServer("10.8.0.1")
-                .setMtu(9000)
+                .setMtu(1500)
                 .setBlocking(false)
                 .establish()
         } catch (t: Throwable) {

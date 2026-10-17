@@ -71,7 +71,10 @@ func (e *Engine) runProbe(sl *Slot, f Family) {
 	ok := false
 	for _, t := range targets {
 		host, port := splitHostPort(t)
-		c, err := e.dialPinned(sl, f, "tcp", host, port, probeTimeout)
+		// dialBound includes the unpinned fallback: a link that can carry
+		// traffic (even via OS routing when interface pinning is broken
+		// by the carrier, e.g. Jio 464XLAT) counts as up.
+		c, err := e.dialBound(sl, f, "tcp", host, port, probeTimeout)
 		if err == nil {
 			c.Close()
 			ok = true

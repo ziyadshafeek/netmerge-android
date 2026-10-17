@@ -54,24 +54,16 @@ var testDialRewrite map[string]string
 // cannot wander to another link even if routes change mid-dial.
 //
 // Fallback: if the pinned dial fails at the link level (some carriers /
-// 464XLAT setups break SO_BINDTOIFINDEX), retry with VPN protection only
-// and let the OS route normally. Single-link connectivity then works even
-// when pinning is broken; the scheduler still prefers pinned links.
-//
-// NOTE: probes must use dialPinned (below), not this: a fallback success
-// via the default route would falsely mark a broken link as up.
+// 464XLAT setups, e.g. Jio, break SO_BINDTOIFINDEX or need CLAT), retry
+// with VPN protection only and let the OS route normally. The link then
+// still carries traffic; the scheduler prefers pinned links when pinning
+// works.
 func (e *Engine) dialBound(sl *Slot, f Family, proto, host string, port int, timeout time.Duration) (net.Conn, error) {
-	c, err := e.dialPinned(sl, f, proto, host, port, timeout)
+	c, err := e.dialWith(sl, f, proto, host, port, timeout, true)
 	if err == nil || !isLinkDown(err) {
 		return c, err
 	}
 	return e.dialWith(sl, f, proto, host, port, timeout, false)
-}
-
-// dialPinned is dialBound without the unpinned fallback: for probes, where
-// a fallback success must not masquerade as link health.
-func (e *Engine) dialPinned(sl *Slot, f Family, proto, host string, port int, timeout time.Duration) (net.Conn, error) {
-	return e.dialWith(sl, f, proto, host, port, timeout, true)
 }
 
 // protectOnlyControl returns a Dialer Control func that protects the socket

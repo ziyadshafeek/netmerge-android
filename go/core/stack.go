@@ -26,7 +26,7 @@ import (
 
 const (
 	nicID        = 1
-	tunMTU       = 9000
+	tunMTU       = 1500
 	dialTimeout  = 10 * time.Second
 	failCooldown = 15 * time.Second
 )
