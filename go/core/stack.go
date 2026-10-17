@@ -1,11 +1,13 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -72,6 +74,12 @@ type Engine struct {
 	scheduler *Scheduler
 	protector Protector
 
+	// Multipath compounding engine (zero-VPS bandwidth bonding)
+	mpEngine *multipath.OnPhoneCompoundEngine
+
+	// Loopback HTTP server for 127.0.0.1:18080 compounding
+	loopbackSrv *http.Server
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 
@@ -131,6 +139,11 @@ func newEngine(tunFd int, protector Protector, cfg config) (*Engine, error) {
 		stopCh:      make(chan struct{}),
 		udpSessions: map[string]*udpSession{},
 	}
+	// Initialize the on-phone compounding engine (VIP resolver, splicer, etc.)
+	e.newMultipathEngine()
+
+	// Start the 127.0.0.1:18080 loopback compounding server
+	e.startLoopbackServer()
 
 	tcpFwd := tcp.NewForwarder(s, 0, 4096, e.handleTCP)
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
@@ -231,10 +244,34 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 	host := tcpipToIP(id.LocalAddress).String()
 	port := int(id.LocalPort)
 
-	upstream, slot, err := e.dialTCP(f, host, port)
-	if err != nil {
-		r.Complete(true) // RST: no usable network
-		return
+	// Check if this is a synthetic VIP from our DNS interceptor.
+	// If so, use the DualEndpoint for dual-link dialing.
+	var upstream net.Conn
+	var slot *Slot
+	var err error
+
+	if e.mpEngine != nil {
+		if dualEP := e.mpEngine.DNS.LookupVIP(host); dualEP != nil {
+			// VIP hit: race both links via the bound dialer
+			ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+			defer cancel()
+			binder := &protectorBinder{p: e.protector}
+			upstream, _, err = multipath.DialRace(ctx, binder, dualEP.WiFiAddr, dualEP.CellAddr, strconv.Itoa(port))
+			if err == nil {
+				// For VIP flows, we don't use the legacy scheduler slot
+				// (the multipath engine manages link selection)
+				slot = nil
+			}
+		}
+	}
+
+	// Fallback to legacy single-link dial if not a VIP or race failed
+	if upstream == nil {
+		upstream, slot, err = e.dialTCP(f, host, port)
+		if err != nil {
+			r.Complete(true) // RST: no usable network
+			return
+		}
 	}
 	var wq waiter.Queue
 	ep, terr := r.CreateEndpoint(&wq)
@@ -286,6 +323,8 @@ type udpSession struct {
 	upstream net.Conn
 	slot     *Slot
 	family   Family
+	dstPort  int
+	dstHost  string
 	lastAct  atomic.Int64 // unix nanos of last datagram either way
 	closed   atomic.Bool
 	closeCh  chan struct{}
@@ -361,7 +400,7 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 
 	us := &udpSession{
 		key: key, tunConn: tunConn, upstream: upstream,
-		slot: sl, family: f, closeCh: make(chan struct{}),
+		slot: sl, family: f, dstPort: dstPort, dstHost: dstHost, closeCh: make(chan struct{}),
 	}
 	us.touch()
 	e.udpMu.Lock()
@@ -396,6 +435,30 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 			}
 			us.touch()
 			us.slot.bytesIn[us.family].Add(int64(n))
+
+			// DNS interception: if this is a port-53 query and our interceptor
+			// returns a synthetic VIP response, send it back directly without
+			// going upstream. This breaks HTTP/2 coalescing (RFC 9113).
+			if us.dstPort == 53 && e.mpEngine != nil {
+				if resp := e.mpEngine.DNS.HandleQuery((*buf)[:n]); resp != nil {
+					if _, err := us.tunConn.WriteTo(resp, clientAddr); err != nil {
+						return
+					}
+					continue // Don't forward to upstream
+				}
+			}
+
+			// Elephant QUIC guard: if this is UDP/443 and the flow becomes
+			// a bulk transfer (>2.5MB at >500KB/s), evict it so the app
+			// falls back to TCP (which we can compound across links).
+			if us.dstPort == 443 && e.mpEngine != nil {
+				// Use a flow ID based on the session key
+				if e.mpEngine.QUICGuard.OnUDPPacket(us.key, 0, us.dstHost, 443, n, true) {
+					// Evicted: close the session, app will retry over TCP
+					return
+				}
+			}
+
 			if _, err := us.upstream.Write((*buf)[:n]); err != nil {
 				return
 			}
@@ -442,14 +505,30 @@ var bufPool = sync.Pool{New: func() any { b := make([]byte, 128<<10); return &b 
 func (e *Engine) relayTCP(client, upstream net.Conn, sl *Slot, f Family) {
 	var wg sync.WaitGroup
 	var once sync.Once
-	release := func() { once.Do(func() { e.scheduler.ReleaseFor(sl, f) }) }
+	release := func() {
+		once.Do(func() {
+			if sl != nil {
+				e.scheduler.ReleaseFor(sl, f)
+			}
+		})
+	}
+	// For VIP flows (sl == nil), use dummy counters
+	var bytesOut, bytesIn atomic.Int64
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		pump(upstream, client, &sl.bytesOut[f])
+		if sl != nil {
+			pump(upstream, client, &sl.bytesOut[f])
+		} else {
+			pump(upstream, client, &bytesOut)
+		}
 		release()
 	}()
-	pump(client, upstream, &sl.bytesIn[f])
+	if sl != nil {
+		pump(client, upstream, &sl.bytesIn[f])
+	} else {
+		pump(client, upstream, &bytesIn)
+	}
 	release()
 	wg.Wait()
 	client.Close()
