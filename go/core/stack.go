@@ -22,6 +22,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
+
+	"netmerge/core/multipath"
 )
 
 const (
@@ -116,6 +118,10 @@ func newEngine(tunFd int, protector Protector, cfg config) (*Engine, error) {
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
+
+	// Tune gVisor's TCP stack for high-BDP dual-link (Wi-Fi + 5G) bonding.
+	// Default buffers are too small and cap single-connection throughput.
+	multipath.ConfigureGVisorTCP(s)
 
 	e := &Engine{
 		stack:       s,
