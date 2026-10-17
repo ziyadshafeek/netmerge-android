@@ -27,9 +27,22 @@ import (
 // so the egress socket bypasses the TUN interface. It is invoked from the
 // dialer's Control callback, i.e. after the socket exists but before
 // connect() completes.
+//
+// BindAndProtect is the preferred path on Android: it calls
+// VpnService.protect(fd) AND Network.bindSocket() for the given network
+// type (1=Wi-Fi, 2=Cellular). Network.bindSocket sets the correct kernel
+// fwmark, which handles 464XLAT/CLAT on carriers like Jio — raw
+// SO_BINDTOIFINDEX bypasses the translator and breaks IPv4.
 type Protector interface {
 	Protect(fd int)
+	BindAndProtect(fd int, networkType int) bool
 }
+
+// Network types for BindAndProtect (must match Kotlin).
+const (
+	NetWiFi     = 1
+	NetCellular = 2
+)
 
 var (
 	apiMu sync.Mutex

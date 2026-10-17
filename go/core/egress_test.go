@@ -14,6 +14,7 @@ type recordProtector struct {
 }
 
 func (p *recordProtector) Protect(fd int) { p.fds = append(p.fds, fd) }
+func (p *recordProtector) BindAndProtect(fd int, networkType int) bool { return false }
 
 // The Control callback must pin the socket to the interface AND protect it,
 // before connect() runs.
@@ -59,9 +60,12 @@ func TestEgressControlBindsAndProtects(t *testing.T) {
 
 // No ifindex -> no control func (unbound dial, e.g. before networks arrive).
 func TestEgressControlNilWithoutIfIndex(t *testing.T) {
+	// egressControl now always returns a func: it tries Network.bindSocket
+	// via the protector first, falling back to SO_BINDTOIFINDEX. The func
+	// itself is never nil.
 	e := &Engine{}
-	if ctl := e.egressControl(&Slot{}); ctl != nil {
-		t.Fatal("want nil control for ifindex 0")
+	if ctl := e.egressControl(&Slot{}); ctl == nil {
+		t.Fatal("want non-nil control even for ifindex 0 (bindSocket path)")
 	}
 }
 

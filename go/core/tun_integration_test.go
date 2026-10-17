@@ -194,6 +194,7 @@ func TestTunIntegration(t *testing.T) {
 type noopProtector struct{}
 
 func (noopProtector) Protect(fd int) {}
+func (noopProtector) BindAndProtect(fd int, networkType int) bool { return false }
 
 func loIfIndex() (int, error) {
 	ifc, err := net.InterfaceByName("lo")

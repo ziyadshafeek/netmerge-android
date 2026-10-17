@@ -56,11 +56,38 @@ class NetMergeVpnService : VpnService() {
     private var pushJob: Job? = null
     private var statsJob: Job? = null
 
+    // Maps network ID (Network.toString()) -> Network object, for bindAndProtect.
+    // Updated on every pushNetworks().
+    private val networkObjects = mutableMapOf<String, Network>()
+    private var wifiNetworkId: String? = null
+    private var cellularNetworkId: String? = null
+
     // Called by Go from the dialer's Control callback, pre-connect, so the
     // egress socket bypasses this VPN (no routing loop).
     private val protector = object : Protector {
         override fun protect(fd: Long) {
             this@NetMergeVpnService.protect(fd.toInt())
+        }
+
+        override fun bindAndProtect(fd: Long, networkType: Long): Boolean {
+            // Protect first so the socket never goes through the TUN.
+            if (!this@NetMergeVpnService.protect(fd.toInt())) return false
+            val netId = if (networkType == 1L) wifiNetworkId else cellularNetworkId
+            val network = netId?.let { networkObjects[it] } ?: return false
+            return try {
+                // adoptFd takes ownership; detachFd gives it back without
+                // closing, so Go's socket fd stays valid.
+                val pfd = ParcelFileDescriptor.adoptFd(fd.toInt())
+                try {
+                    network.bindSocket(pfd.fileDescriptor)
+                    true
+                } finally {
+                    pfd.detachFd()
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "bindAndProtect failed", t)
+                false
+            }
         }
     }
 
@@ -191,9 +218,17 @@ class NetMergeVpnService : VpnService() {
                 for (d in lp.dnsServers) {
                     d.hostAddress?.let { dns.put(it) }
                 }
+                val netId = network.toString()
+                // Remember the Network object + which ID is Wi-Fi vs Cellular
+                // for bindAndProtect().
+                networkObjects[netId] = network
+                when (transport) {
+                    "WIFI" -> if (wifiNetworkId == null) wifiNetworkId = netId
+                    "CELLULAR" -> if (cellularNetworkId == null) cellularNetworkId = netId
+                }
                 arr.put(
                     JSONObject()
-                        .put("id", network.toString())
+                        .put("id", netId)
                         .put("name", ifName)
                         .put("displayName", transportLabel(transport))
                         .put("transport", transport)
@@ -204,6 +239,12 @@ class NetMergeVpnService : VpnService() {
                 )
             }
             Core.updateNetworks(arr.toString())
+            // Prune Network objects that disappeared.
+            val liveIds = mutableSetOf<String>()
+            for (i in 0 until arr.length()) liveIds.add(arr.getJSONObject(i).getString("id"))
+            networkObjects.keys.retainAll(liveIds)
+            if (wifiNetworkId !in liveIds) wifiNetworkId = null
+            if (cellularNetworkId !in liveIds) cellularNetworkId = null
         } catch (t: Throwable) {
             Log.w(TAG, "pushNetworks failed", t)
         }

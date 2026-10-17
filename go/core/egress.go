@@ -11,35 +11,42 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// egressControl returns a Dialer Control func that pins the socket to the
-// network's interface and protects it from the VPN. Both happen inside the
-// Control callback, i.e. after the socket exists but BEFORE connect()
-// completes, so the SYN can never leak through the TUN (no routing loop).
+// egressControl returns a Dialer Control func that binds the socket to the
+// network via Android's Network.bindSocket() (through the Kotlin Protector)
+// and protects it from the VPN. Both happen inside the Control callback,
+// i.e. after the socket exists but BEFORE connect() completes, so the SYN
+// can never leak through the TUN (no routing loop).
 //
-// SO_BINDTOIFINDEX (the ifindex, not the name) is used so no per-socket
-// name lookup is needed; it has been unprivileged since Linux 5.7.
+// We use Network.bindSocket() instead of raw SO_BINDTOIFINDEX because the
+// latter bypasses Android's 464XLAT/CLAT translator on carriers like Jio,
+// breaking IPv4. Network.bindSocket() sets the correct fwmark and handles
+// both native IPv6 and translated IPv4.
 func (e *Engine) egressControl(sl *Slot) func(network, address string, c syscall.RawConn) error {
-	if sl.IfIndex <= 0 {
-		return nil
+	netType := NetWiFi
+	if sl.Transport == "CELLULAR" {
+		netType = NetCellular
 	}
-	iface := sl.IfIndex
 	return func(network, address string, c syscall.RawConn) error {
-		var serr error
+		var berr error
 		if err := c.Control(func(fd uintptr) {
-			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BINDTOIFINDEX, iface)
-			if serr != nil {
+			// Prefer Android's Network.bindSocket via Kotlin; fall back to
+			// raw SO_BINDTOIFINDEX if the binder is unavailable.
+			if e.protector != nil && e.protector.BindAndProtect(int(fd), netType) {
 				return
 			}
-			// Protect AFTER binding: the socket is fully configured and
-			// still pre-connect, which is exactly what VpnService.protect
-			// requires.
+			if sl.IfIndex > 0 {
+				berr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BINDTOIFINDEX, sl.IfIndex)
+				if berr != nil {
+					return
+				}
+			}
 			if e.protector != nil {
 				e.protector.Protect(int(fd))
 			}
 		}); err != nil {
 			return err
 		}
-		return serr
+		return berr
 	}
 }
 
