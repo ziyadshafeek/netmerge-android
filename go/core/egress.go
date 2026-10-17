@@ -70,7 +70,37 @@ func (e *Engine) dialBound(sl *Slot, f Family, proto, host string, port int, tim
 	if err == nil || !isLinkDown(err) {
 		return c, err
 	}
+	// NAT64 fallback: if this is cellular (e.g. Jio IPv6-only) and the target
+	// is an IPv4 literal that failed with ENETUNREACH, try RFC 6052 synthesis
+	// (64:ff9b::/96) over native IPv6. This handles the case where Android
+	// doesn't run clatd on the secondary cellular interface.
+	if sl.Transport == "CELLULAR" && f == Fam4 {
+		if nat64Host := synthesizeNAT64(host); nat64Host != "" {
+			if c6, err6 := e.dialWith(sl, Fam6, proto, nat64Host, port, timeout, true); err6 == nil {
+				return c6, nil
+			}
+		}
+	}
 	return e.dialWith(sl, f, proto, host, port, timeout, false)
+}
+
+// synthesizeNAT64 converts an IPv4 address (e.g. "1.1.1.1") into an RFC 6052
+// Well-Known Prefix IPv6 address ("64:ff9b::101:101") so IPv6-only cellular
+// (Jio) can reach IPv4 servers even when Android doesn't run clatd on the
+// secondary cellular interface.
+func synthesizeNAT64(ipv4Str string) string {
+	ip := net.ParseIP(ipv4Str).To4()
+	if ip == nil {
+		return ""
+	}
+	// 64:ff9b::/96 + 32 bits of IPv4
+	nat64IP := net.IP{
+		0x00, 0x64, 0xff, 0x9b,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		ip[0], ip[1], ip[2], ip[3],
+	}
+	return nat64IP.String()
 }
 
 // protectOnlyControl returns a Dialer Control func that protects the socket
