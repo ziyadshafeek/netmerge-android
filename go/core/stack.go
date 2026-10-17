@@ -420,8 +420,10 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 	defer func() { _ = recover() }()
 	defer e.dropUDPSession(us)
 
+	// Simplified bidirectional relay: io.Copy in both directions.
+	// DNS VIP interception happens on the TUN->upstream path before forwarding.
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 	go func() { // TUN -> upstream
 		defer wg.Done()
 		buf := bufPool.Get().(*[]byte)
@@ -431,32 +433,26 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 			n, _, err := us.tunConn.ReadFrom((*buf)[:cap(*buf)])
 			if err != nil {
 				if isTimeout(err) && us.idle() < udpIdleTimeout {
-					continue // one-sided quiet spell, not idle yet
+					continue
 				}
 				return
 			}
 			us.touch()
 			us.slot.bytesIn[us.family].Add(int64(n))
 
-			// DNS interception: if this is a port-53 query and our interceptor
-			// returns a synthetic VIP response, send it back directly without
-			// going upstream. This breaks HTTP/2 coalescing (RFC 9113).
+			// DNS interception: synthetic VIP response goes straight back.
 			if us.dstPort == 53 && e.mpEngine != nil {
 				if resp := e.mpEngine.DNS.HandleQuery((*buf)[:n]); resp != nil {
 					if _, err := us.tunConn.WriteTo(resp, clientAddr); err != nil {
 						return
 					}
-					continue // Don't forward to upstream
+					continue
 				}
 			}
 
-			// Elephant QUIC guard: if this is UDP/443 and the flow becomes
-			// a bulk transfer (>2.5MB at >500KB/s), evict it so the app
-			// falls back to TCP (which we can compound across links).
+			// Elephant QUIC guard: evict bulk QUIC to TCP.
 			if us.dstPort == 443 && e.mpEngine != nil {
-				// Use a flow ID based on the session key
 				if e.mpEngine.QUICGuard.OnUDPPacket(us.key, 0, us.dstHost, 443, n, true) {
-					// Evicted: close the session, app will retry over TCP
 					return
 				}
 			}
@@ -466,24 +462,27 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 			}
 		}
 	}()
-	// upstream -> TUN (runs on this goroutine)
-	buf := bufPool.Get().(*[]byte)
-	defer bufPool.Put(buf)
-	for {
-		us.upstream.SetReadDeadline(time.Now().Add(udpPollInterval))
-		n, err := us.upstream.Read((*buf)[:cap(*buf)])
-		if err != nil {
-			if isTimeout(err) && us.idle() < udpIdleTimeout {
-				continue
+	go func() { // upstream -> TUN
+		defer wg.Done()
+		buf := bufPool.Get().(*[]byte)
+		defer bufPool.Put(buf)
+		for {
+			us.upstream.SetReadDeadline(time.Now().Add(udpPollInterval))
+			n, err := us.upstream.Read((*buf)[:cap(*buf)])
+			if err != nil {
+				if isTimeout(err) && us.idle() < udpIdleTimeout {
+					continue
+				}
+				return
 			}
-			return
+			us.touch()
+			us.slot.bytesOut[us.family].Add(int64(n))
+			if _, err := us.tunConn.WriteTo((*buf)[:n], clientAddr); err != nil {
+				return
+			}
 		}
-		us.touch()
-		us.slot.bytesOut[us.family].Add(int64(n))
-		if _, err := us.tunConn.WriteTo((*buf)[:n], clientAddr); err != nil {
-			return
-		}
-	}
+	}()
+	wg.Wait()
 }
 
 func (e *Engine) dropUDPSession(us *udpSession) {
