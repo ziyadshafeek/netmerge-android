@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,8 +21,28 @@ import (
 // Files smaller than this are streamed directly on the best link.
 const MinCompoundSize int64 = 512 * 1024
 
+// byteCounterWriter wraps an io.Writer to report bytes in real-time via the binder.
+type byteCounterWriter struct {
+	w        io.Writer
+	binder   SocketBinder
+	link     int
+	isUpload bool
+}
+
+func (bw *byteCounterWriter) Write(p []byte) (int, error) {
+	n, err := bw.w.Write(p)
+	if n > 0 && bw.binder != nil {
+		if bw.isUpload {
+			bw.binder.OnBytes(bw.link, 0, int64(n))
+		} else {
+			bw.binder.OnBytes(bw.link, int64(n), 0)
+		}
+	}
+	return n, err
+}
+
 // HandleGVisorTCPStream is called for every TCP connection from the app.
-// It peeks at the first bytes to determine the protocol:
+// It reads the full initial payload (up to 8KB) to determine the protocol:
 //
 //   - TLS/encrypted (0x16, banking, UPI, SSH): uses ForwardWithMidHandshakeReplay
 //     for dual-link SYN racing with ClientHello replay failover. Zero TLS
@@ -38,20 +59,30 @@ func (e *OnPhoneCompoundEngine) HandleGVisorTCPStream(
 	defer clientConn.Close()
 	portStr := strconv.Itoa(int(dstPort))
 
-	// Peek first 8 bytes to detect protocol
-	_ = clientConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	peekBuf := make([]byte, 8)
-	n, _ := clientConn.Read(peekBuf)
+	// Read the full initial client payload (up to 8KB) in one shot, NOT 8 bytes!
+	// The old 8-byte peek + io.MultiReader caused ForwardWithMidHandshakeReplay
+	// to send only 8 bytes of the TLS ClientHello upstream, killing every HTTPS
+	// connection. We now read the complete first chunk here.
+	_ = clientConn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	firstChunk := make([]byte, 8192)
+	n, _ := clientConn.Read(firstChunk)
+	// If it's a TLS ClientHello (0x16), ensure we have the complete TLS record
+	if n >= 5 && firstChunk[0] == 0x16 {
+		recLen := 5 + (int(firstChunk[3])<<8 | int(firstChunk[4]))
+		if recLen > n && recLen <= len(firstChunk) {
+			extra, _ := io.ReadFull(clientConn, firstChunk[n:recLen])
+			n += extra
+		}
+	}
 	_ = clientConn.SetReadDeadline(time.Time{})
 
-	replayedReader := io.MultiReader(bytes.NewReader(peekBuf[:n]), clientConn)
-
-	// If NOT a plain HTTP GET, use speculative racing with replay
-	if n < 4 || string(peekBuf[:4]) != "GET " {
-		return e.ForwardWithMidHandshakeReplay(ctx, clientConn, replayedReader, ep, portStr)
+	// If NOT a plain HTTP GET, forward with dual-link striping & handshake failover
+	if n < 4 || string(firstChunk[:4]) != "GET " {
+		return e.ForwardWithMidHandshakeReplay(ctx, clientConn, firstChunk[:n], ep, portStr)
 	}
 
-	// It's HTTP GET - parse the request
+	// Plain HTTP GET: wrap full stream for HTTP parser
+	replayedReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), clientConn)
 	bufReader := bufio.NewReader(replayedReader)
 	req, err := http.ReadRequest(bufReader)
 	if err != nil {
@@ -78,61 +109,71 @@ func (e *OnPhoneCompoundEngine) HandleGVisorTCPStream(
 //  2. TLS ClientHello replay on a new TCP socket is valid - the app holds the
 //     ephemeral private key and completes with any valid ServerHello
 //     (RFC 8446).
+//
+// NOTE: firstPayload must be the COMPLETE initial client payload (e.g. the
+// full TLS ClientHello record), not a truncated peek. The old io.MultiReader
+// 8-byte peek caused every TLS handshake to time out.
 func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 	ctx context.Context,
 	clientConn net.Conn,
-	initialReader io.Reader,
+	firstPayload []byte,
 	ep *DualEndpoint,
 	port string,
 ) error {
-	// Race both links
 	raceCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, e.Scheduler.PickOptimalLink(64*1024))
+	// Pass preferred = 0 so StripedPreferredLink() spreads parallel TCP
+	// streams across Wi-Fi & Cellular instead of Wi-Fi winning every race.
+	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, 0)
 	if err != nil {
 		return err
 	}
 
-	// Get standby connection (if available)
-	var standbyConn net.Conn
-	var standbyLink LinkType
-	select {
-	case res := <-standbyCh:
-		if res.err == nil {
-			standbyConn = res.conn
-			standbyLink = res.link
-		}
-	case <-time.After(500 * time.Millisecond):
-		// No standby available
+	var standbyUsed atomic.Bool
+	drainStandby := func() {
+		go func() {
+			for res := range standbyCh {
+				if res.err == nil && res.conn != nil {
+					res.conn.Close()
+				}
+			}
+		}()
 	}
-
-	// Ensure standby is closed if not used
+	// Always drain standbyCh in background if unused so standby sockets never leak.
 	defer func() {
-		if standbyConn != nil {
-			standbyConn.Close()
+		if !standbyUsed.Load() {
+			drainStandby()
 		}
 	}()
 
-	// Read initial payload (e.g., ClientHello)
-	firstPayload := make([]byte, 8192)
-	_ = clientConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	n, readErr := initialReader.Read(firstPayload)
-	_ = clientConn.SetReadDeadline(time.Time{})
+	getStandby := func() (net.Conn, LinkType) {
+		if !standbyUsed.CompareAndSwap(false, true) {
+			return nil, 0
+		}
+		select {
+		case res, ok := <-standbyCh:
+			if ok && res.err == nil && res.conn != nil {
+				return res.conn, res.link
+			}
+		case <-time.After(1500 * time.Millisecond):
+			drainStandby()
+		}
+		return nil, 0
+	}
 
 	activeUpstream := primaryConn
 	activeLink := primaryLink
 
-	if n > 0 {
-		// Send on primary
-		if _, wErr := activeUpstream.Write(firstPayload[:n]); wErr != nil {
-			// Primary failed immediately, try standby
-			if standbyConn != nil {
+	if len(firstPayload) > 0 {
+		_, wErr := activeUpstream.Write(firstPayload)
+		if wErr != nil {
+			// Primary write failed immediately; try standby
+			if sbConn, sbLink := getStandby(); sbConn != nil {
 				activeUpstream.Close()
-				activeUpstream = standbyConn
-				activeLink = standbyLink
-				standbyConn = nil
-				if _, wErr2 := activeUpstream.Write(firstPayload[:n]); wErr2 != nil {
+				activeUpstream = sbConn
+				activeLink = sbLink
+				if _, wErr2 := activeUpstream.Write(firstPayload); wErr2 != nil {
 					activeUpstream.Close()
 					return wErr2
 				}
@@ -141,92 +182,77 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 				return wErr
 			}
 		} else {
-			// Wait for first response byte with timeout
-			_ = activeUpstream.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+			if e.Binder != nil {
+				e.Binder.OnBytes(int(activeLink), 0, int64(len(firstPayload)))
+			}
+			// Wait up to 1.5s for first response packet (ServerHello)
+			_ = activeUpstream.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
 			firstResp := make([]byte, 8192)
 			rn, rErr := activeUpstream.Read(firstResp)
 			_ = activeUpstream.SetReadDeadline(time.Time{})
 
 			if rn > 0 {
-				// Primary responded! Write to client and continue
+				if e.Binder != nil {
+					e.Binder.OnBytes(int(activeLink), int64(rn), 0)
+				}
 				if _, err := clientConn.Write(firstResp[:rn]); err != nil {
 					activeUpstream.Close()
 					return err
 				}
-				// Close standby, we don't need it
-				if standbyConn != nil {
-					standbyConn.Close()
-					standbyConn = nil
-				}
-			} else if rErr != nil && standbyConn != nil {
-				// Primary stalled! Replay on standby
-				activeUpstream.Close()
-				activeUpstream = standbyConn
-				activeLink = standbyLink
-				standbyConn = nil
-				if _, err := activeUpstream.Write(firstPayload[:n]); err != nil {
+			} else if rErr != nil {
+				// Primary failed/stalled with 0 bytes received. Only switch if standby is live!
+				if sbConn, sbLink := getStandby(); sbConn != nil {
 					activeUpstream.Close()
-					return err
-				}
-				// Read response from standby and forward
-				_ = activeUpstream.SetReadDeadline(time.Now().Add(5 * time.Second))
-				rn2, rErr2 := activeUpstream.Read(firstResp)
-				_ = activeUpstream.SetReadDeadline(time.Time{})
-				if rn2 > 0 {
-					if _, err := clientConn.Write(firstResp[:rn2]); err != nil {
+					activeUpstream = sbConn
+					activeLink = sbLink
+					if _, err := activeUpstream.Write(firstPayload); err != nil {
 						activeUpstream.Close()
 						return err
 					}
-				} else if rErr2 != nil {
+					if e.Binder != nil {
+						e.Binder.OnBytes(int(activeLink), 0, int64(len(firstPayload)))
+					}
+				} else if !isTimeoutErr(rErr) {
 					activeUpstream.Close()
-					return rErr2
+					return rErr
 				}
 			}
 		}
-	} else if readErr != nil {
-		activeUpstream.Close()
-		return readErr
 	}
 
 	defer activeUpstream.Close()
+	// Track this active flow for the full lifetime of the TCP stream!
+	defer TrackFlow(activeLink)()
 
-	// Full-duplex relay with goodput tracking and half-close support.
-	// SAFETY: At this point, activeUpstream has either:
-	// - Responded with >0 bytes (primary won, standby closed), OR
-	// - Failed with 0 bytes (failover to standby, primary closed).
-	// We NEVER interleave bytes from two different upstream connections.
 	errCh := make(chan error, 2)
 	go func() {
-		// Upload: client -> upstream
-		written, err := io.Copy(activeUpstream, initialReader)
-		// Report upload bytes to scheduler slots via binder
-		if e.Binder != nil {
-			e.Binder.OnBytes(int(activeLink), 0, written)
-		}
-		// Half-close: signal EOF to upstream without closing the read side.
+		// Upload: client -> upstream (real-time byte counting)
+		upWriter := &byteCounterWriter{w: activeUpstream, binder: e.Binder, link: int(activeLink), isUpload: true}
+		_, err := io.Copy(upWriter, clientConn)
 		if cw, ok := activeUpstream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 		errCh <- err
 	}()
 	go func() {
-		start := time.Now()
-		// Download: upstream -> client
-		written, err := io.Copy(clientConn, activeUpstream)
-		// Report download bytes to scheduler slots via binder
-		if e.Binder != nil {
-			e.Binder.OnBytes(int(activeLink), written, 0)
-		}
-		// Record for ECT scheduler
-		if activeLink == LinkWiFi {
-			e.Scheduler.WiFi.RecordTransfer(written, time.Since(start))
-		} else {
-			e.Scheduler.Cell.RecordTransfer(written, time.Since(start))
+		// Download: upstream -> client (real-time byte counting)
+		downWriter := &byteCounterWriter{w: clientConn, binder: e.Binder, link: int(activeLink), isUpload: false}
+		_, err := io.Copy(downWriter, activeUpstream)
+		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
 		}
 		errCh <- err
 	}()
+	<-errCh
+	<-errCh
+	return nil
+}
 
-	return <-errCh
+func isTimeoutErr(err error) bool {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	return false
 }
 
 // compoundHTTPStream handles HTTP GET with range-based compounding.

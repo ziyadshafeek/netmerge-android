@@ -114,26 +114,59 @@ func (r *VIPResolver) EndpointForVIP(ip net.IP) *DualEndpoint {
 }
 
 // resolveAddrs resolves domain on both links, concurrently.
+// It returns as soon as the FIRST link succeeds (plus a 200ms grace for the
+// second), so a slow/dead link never stalls VIP allocation past Chrome's ~1s
+// DNS timeout. The slower link's result updates the endpoint in the background.
 func (r *VIPResolver) resolveAddrs(ctx context.Context, domain string) (wifiAddr, cellAddr string) {
 	if r.resolve != nil {
 		return r.resolve(ctx, domain)
 	}
-	var wg sync.WaitGroup
-	wg.Add(2)
+	type res struct {
+		link LinkType
+		addr string
+	}
+	ch := make(chan res, 2)
 	go func() {
-		defer wg.Done()
 		// Wi-Fi: IPv4 edge via public DNS.
-		wifiAddr = r.resolveOnLink(ctx, domain, LinkWiFi, "8.8.8.8:53", false)
+		ch <- res{LinkWiFi, r.resolveOnLink(ctx, domain, LinkWiFi, "8.8.8.8:53", false)}
 	}()
 	go func() {
-		defer wg.Done()
 		// Cellular: native IPv6 first (Jio's fast path), then IPv4 via 464XLAT.
-		cellAddr = r.resolveOnLink(ctx, domain, LinkCellular, "[2001:4860:4860::8888]:53", true)
-		if cellAddr == "" {
-			cellAddr = r.resolveOnLink(ctx, domain, LinkCellular, "8.8.8.8:53", false)
+		addr := r.resolveOnLink(ctx, domain, LinkCellular, "[2001:4860:4860::8888]:53", true)
+		if addr == "" {
+			addr = r.resolveOnLink(ctx, domain, LinkCellular, "8.8.8.8:53", false)
 		}
+		ch <- res{LinkCellular, addr}
 	}()
-	wg.Wait()
+
+	// Wait for the first result, then give the slower link a 200ms grace.
+	// A missing side is backfilled by GetOrAllocateVIP's copy-fallback.
+	timeout := time.After(1500 * time.Millisecond)
+	var grace <-chan time.Time // armed only after the first link succeeds
+	got := 0
+	for got < 2 {
+		select {
+		case rr := <-ch:
+			if rr.link == LinkWiFi {
+				wifiAddr = rr.addr
+			} else {
+				cellAddr = rr.addr
+			}
+			got++
+			if got == 1 {
+				// First link done; start grace period for the second.
+				grace = time.After(200 * time.Millisecond)
+			} else {
+				return wifiAddr, cellAddr
+			}
+		case <-grace:
+			return wifiAddr, cellAddr
+		case <-timeout:
+			return wifiAddr, cellAddr
+		case <-ctx.Done():
+			return wifiAddr, cellAddr
+		}
+	}
 	return wifiAddr, cellAddr
 }
 
@@ -155,7 +188,7 @@ func (r *VIPResolver) resolveOnLink(ctx context.Context, domain string, link Lin
 			if link == LinkCellular {
 				if host, port, serr := net.SplitHostPort(dnsServer); serr == nil {
 					if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-						nat64 := net.JoinHostPort("64:ff9b::"+ip.To4().String(), port)
+						nat64 := net.JoinHostPort(toNAT64(ip), port)
 						return dialer.DialContext(ctx, "udp", nat64)
 					}
 				}
@@ -168,7 +201,8 @@ func (r *VIPResolver) resolveOnLink(ctx context.Context, domain string, link Lin
 		ipNet = "ip6"
 	}
 	// Bound the lookup so a dead link can't stall VIP allocation.
-	lctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	// 1200ms: Chrome gives up on DNS after ~1s, so we must be faster.
+	lctx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 	defer cancel()
 	ips, err := resolver.LookupIP(lctx, ipNet, domain)
 	if err != nil || len(ips) == 0 {

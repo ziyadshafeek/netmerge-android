@@ -479,12 +479,26 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 			us.slot.bytesOut[us.family].Add(int64(n))
 
 			// DNS interception: synthetic VIP response goes straight back.
+			// HandleQuery may block on VIP allocation (upstream DNS), so run
+			// it in a goroutine with copied bytes — concurrent queries on
+			// this socket must never block each other.
 			if us.dstPort == 53 && e.mpEngine != nil {
-				if resp := e.mpEngine.DNS.HandleQuery((*buf)[:n]); resp != nil {
-					if _, err := us.tunConn.WriteTo(resp, clientAddr); err != nil {
-						return
+				q := append([]byte(nil), (*buf)[:n]...)
+				respCh := make(chan []byte, 1)
+				go func() {
+					defer func() { _ = recover() }()
+					respCh <- e.mpEngine.DNS.HandleQuery(q)
+				}()
+				select {
+				case resp := <-respCh:
+					if resp != nil {
+						if _, err := us.tunConn.WriteTo(resp, clientAddr); err != nil {
+							return
+						}
+						continue // Don't forward to upstream
 					}
-					continue
+				case <-time.After(2 * time.Second):
+					// HandleQuery stalled; fall through to upstream DNS
 				}
 			}
 

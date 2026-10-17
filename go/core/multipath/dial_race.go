@@ -15,6 +15,16 @@ import (
 // link winning 100% of races).
 var activeFlows [3]atomic.Int64 // indexed by LinkType (1=WiFi, 2=Cellular)
 
+// toNAT64 converts an IPv4 address to its RFC 6052 NAT64 form
+// (64:ff9b::/96) for use on IPv6-only links (e.g. Jio).
+func toNAT64(ip4 net.IP) string {
+	ip4 = ip4.To4()
+	if ip4 == nil {
+		return ""
+	}
+	return net.IP{0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, ip4[0], ip4[1], ip4[2], ip4[3]}.String()
+}
+
 // StripedPreferredLink returns the link that should be preferred for the
 // next connection, based on fewest active flows (weighted striping).
 func StripedPreferredLink() LinkType {
@@ -59,8 +69,9 @@ func DialSpeculativeDualLink(
 	if preferred == 0 {
 		preferred = StripedPreferredLink()
 	}
-	// Track this flow on the preferred link for striping decisions.
-	defer TrackFlow(preferred)()
+	// NOTE: TrackFlow is NOT deferred here. The caller (ForwardWithMidHandshakeReplay)
+	// tracks the flow for the full lifetime of the TCP stream. Deferring here would
+	// decrement activeFlows as soon as the dial finished, defeating striping.
 
 	ch := make(chan raceResult, 2)
 
@@ -88,7 +99,7 @@ func DialSpeculativeDualLink(
 		// (Jio IPv6-only has no IPv4 route), retry via 64:ff9b::/96.
 		if dErr != nil && link == LinkCellular {
 			if ip4 := net.ParseIP(ip); ip4 != nil && ip4.To4() != nil {
-				nat64 := "64:ff9b::" + ip4.To4().String()
+				nat64 := toNAT64(ip4)
 				c, dErr = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
 			}
 		}
