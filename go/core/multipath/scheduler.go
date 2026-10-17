@@ -278,17 +278,32 @@ func (s *Scheduler) SelectLinks(expectedBytes int64) (primary LinkType, secondar
 	}
 	targetWiFiShare := 1.0 - targetCellShare
 
-	// 1. Active Flow-Ratio Enforcement: if Cellular has fewer than its target share
-	// of active flows (or 0 flows while Wi-Fi is active), pin this flow to Cellular
-	// with a 320 ms failover window so 5G NR wakes up and completes the handshake!
+	// 1. Idle-Link Wakeup First: NEVER let either radio sit at 0 flows when the other is busy.
 	totalFlows := wStats.ActiveFlows + cStats.ActiveFlows
-	actualCellShare := float64(cStats.ActiveFlows) / float64(totalFlows+1)
+	actualCellShare := 0.5
+	if totalFlows > 0 {
+		actualCellShare = float64(cStats.ActiveFlows) / float64(totalFlows)
+	}
 
-	if (cStats.ActiveFlows == 0 && wStats.ActiveFlows >= 1) ||
-		(actualCellShare < targetCellShare) ||
-		(seq%2 == 0 && cStats.ActiveFlows <= wStats.ActiveFlows) {
+	if wStats.ActiveFlows == 0 && cStats.ActiveFlows >= 1 {
+		// Wi-Fi is idle while Cellular is active -> force this flow onto Wi-Fi!
+		primary, secondary = LinkWiFi, LinkCellular
+	} else if cStats.ActiveFlows == 0 && wStats.ActiveFlows >= 1 {
+		// Cellular is idle while Wi-Fi is active -> force this flow onto Cellular!
 		primary, secondary = LinkCellular, LinkWiFi
-	} else if wStats.ActiveFlows == 0 && cStats.ActiveFlows >= 1 {
+	} else if totalFlows == 0 {
+		// First flow from idle: alternate cleanly so sequential probes wake both links,
+		// favoring whichever link currently has higher measured goodput.
+		if seq%2 == 1 && wCap >= cCap {
+			primary, secondary = LinkWiFi, LinkCellular
+		} else if seq%2 == 0 {
+			primary, secondary = LinkWiFi, LinkCellular
+		} else {
+			primary, secondary = LinkCellular, LinkWiFi
+		}
+	} else if actualCellShare < targetCellShare {
+		primary, secondary = LinkCellular, LinkWiFi
+	} else if (1.0 - actualCellShare) < targetWiFiShare {
 		primary, secondary = LinkWiFi, LinkCellular
 	} else {
 		// 2. Bounded Deficit Inverse-Completion-Time Water-Filling.

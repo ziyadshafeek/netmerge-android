@@ -112,6 +112,16 @@ func ReArmQuickAck(conn net.Conn) {
 	})
 }
 
+// armKeepAlive enables TCP keepalive with a 30s period so carrier NATs don't
+// silently drop idle keep-alive sockets mid-download (which previously surfaced
+// as mysterious mid-transfer stalls/aborts).
+func armKeepAlive(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+}
+
 // MeteredConn wraps a net.Conn to report exact RX/TX byte counts to SocketBinder
 // and Scheduler without locks on the hot path, while applying first-packet TLS SNI
 // fragmentation for DPI privacy.

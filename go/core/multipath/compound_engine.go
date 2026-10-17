@@ -410,6 +410,11 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	var nextSeg atomic.Int32
 	var flushIdx atomic.Int32
 	retryCh := make(chan int, numSegs)
+	// segAttempts is shared across both workers: a segment aborts the stream
+	// only after 4 failed attempts (both links tried twice), instead of one
+	// worker's local counter stranding the flush loop during a handover.
+	var segAttempts []atomic.Int32
+	segAttempts = make([]atomic.Int32, numSegs)
 
 	worker := func(link LinkType, ip, fallbackIP string) {
 		defer TrackFlow(link)()
@@ -420,13 +425,6 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 				conn.Close()
 			}
 		}()
-
-		// failCount tracks per-segment double-failures on THIS worker.
-		// A segment that fails twice here is handed to retryCh for the other
-		// link to steal; if it fails twice more (both links, 4 attempts
-		// total), the stream is aborted instead of hanging the flush loop
-		// forever waiting on results[idx].
-		failCount := make([]int, numSegs)
 
 		fetchSeg := func(idx int) ([]byte, error) {
 			sStart := reqStart + int64(idx)*spliceChunkSize
@@ -448,7 +446,12 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 			rClone := req.Clone(sctx)
 			rClone.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", sStart, sEnd))
 			rClone.Header.Set("Connection", "keep-alive")
-			_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
+			// Sliding activity watchdog: the segment (request + headers + body)
+			// is only aborted after segStallTimeout with ZERO progress, instead
+			// of a rigid wall-clock budget that kills segments during 5G
+			// tower handovers. The deadline is extended on every chunk read.
+			const segStallTimeout = 12 * time.Second
+			_ = conn.SetDeadline(time.Now().Add(segStallTimeout))
 			if err := rClone.Write(conn); err != nil {
 				conn.Close()
 				conn = nil
@@ -467,20 +470,29 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 				return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 			}
 			buf := make([]byte, expected)
-			readBytes, err := io.ReadFull(resp.Body, buf)
-			resp.Body.Close()
-			_ = conn.SetDeadline(time.Time{})
-			if readBytes > 0 {
-				RecordLinkBytes(link, int64(readBytes))
-				if e.Binder != nil {
-					e.Binder.OnBytes(int(link), int64(readBytes), 0)
+			readBytes := 0
+			for readBytes < expected {
+				n, rErr := resp.Body.Read(buf[readBytes:])
+				if n > 0 {
+					readBytes += n
+					_ = conn.SetDeadline(time.Now().Add(segStallTimeout))
+					RecordLinkBytes(link, int64(n))
+					if e.Binder != nil {
+						e.Binder.OnBytes(int(link), int64(n), 0)
+					}
+				}
+				if rErr != nil {
+					resp.Body.Close()
+					conn.Close()
+					conn = nil
+					if rErr == io.EOF && readBytes == expected {
+						break
+					}
+					return nil, rErr
 				}
 			}
-			if err != nil {
-				conn.Close()
-				conn = nil
-				return nil, err
-			}
+			resp.Body.Close()
+			_ = conn.SetDeadline(time.Time{})
 			return buf, nil
 		}
 
@@ -515,11 +527,16 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 
 			data, err := fetchSeg(idx)
 			if err != nil {
-				// Retry once on this link; if still failing, hand off to retryCh so the other link steals it!
+				// Brief backoff so a momentary stall doesn't instantly burn attempts.
+				select {
+				case <-sctx.Done():
+					return
+				case <-time.After(150 * time.Millisecond):
+				}
+				// Retry once more; if still failing, hand off to retryCh so the other link steals it!
 				data, err = fetchSeg(idx)
 				if err != nil {
-					failCount[idx]++
-					if failCount[idx] >= 2 {
+					if segAttempts[idx].Add(2) >= 4 {
 						// Both links have now failed this segment twice:
 						// abort the stream instead of stranding the flush
 						// loop (which would hang until ctx timeout).

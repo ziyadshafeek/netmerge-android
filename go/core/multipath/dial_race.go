@@ -199,6 +199,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 		}
+		armKeepAlive(c)
 	}
 	return c, err
 }

@@ -272,16 +272,24 @@ func (r *Racer) dialSingleWithFallback(
 	r.scheduler.RecordRTT(link, rtt)
 	r.scheduler.RecordSuccess(link)
 	r.scheduler.AcquireFlow(link)
+	armKeepAlive(c)
 	ReArmQuickAck(c)
 	return NewMeteredConn(c, r.binder, r.scheduler, link), nil
 }
 
 // RelayBidirectional splices traffic between local and remote sockets using
 // 256 KB pooled buffers to eliminate GC pressure at multi-hundred-Mbps speeds.
+// A normal EOF on the upload side (e.g. the HTTP request is fully sent while the
+// download runs for minutes) does NOT kill the download direction: deadlines are
+// only forced on real socket errors or when the server side finishes.
 func RelayBidirectional(local, remote net.Conn) error {
-	errCh := make(chan error, 2)
+	type copyRes struct {
+		dir string
+		err error
+	}
+	resCh := make(chan copyRes, 2)
 
-	copyDir := func(dst, src net.Conn) {
+	copyDir := func(dir string, dst, src net.Conn) {
 		bufPtr := spliceBufferPool.Get().(*[]byte)
 		buf := *bufPtr
 		_, err := io.CopyBuffer(dst, src, buf)
@@ -289,25 +297,29 @@ func RelayBidirectional(local, remote net.Conn) error {
 		if tcp, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = tcp.CloseWrite()
 		}
-		errCh <- err
+		resCh <- copyRes{dir: dir, err: err}
 	}
 
-	go copyDir(remote, local)
-	go copyDir(local, remote)
+	go copyDir("tx", remote, local)
+	go copyDir("rx", local, remote)
 
-	firstErr := <-errCh
-	_ = local.SetDeadline(time.Now().Add(250 * time.Millisecond))
-	_ = remote.SetDeadline(time.Now().Add(250 * time.Millisecond))
-	secondErr := <-errCh
+	first := <-resCh
+	// Only force-abort the other direction immediately if an actual socket error
+	// occurred, or if the server ("rx") finished sending the response.
+	if first.err != nil || first.dir == "rx" {
+		_ = local.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		_ = remote.SetDeadline(time.Now().Add(500 * time.Millisecond))
+	}
+	second := <-resCh
 
 	_ = local.Close()
 	_ = remote.Close()
 
-	if firstErr != nil && !errors.Is(firstErr, io.EOF) {
-		return firstErr
+	if first.err != nil && !errors.Is(first.err, io.EOF) {
+		return first.err
 	}
-	if secondErr != nil && !errors.Is(secondErr, io.EOF) {
-		return secondErr
+	if second.err != nil && !errors.Is(second.err, io.EOF) {
+		return second.err
 	}
 	return nil
 }
