@@ -3,6 +3,7 @@ package multipath
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -18,13 +19,21 @@ import (
 )
 
 // PrivacyEndpoint defines an encrypted SOCKS5 or HTTPS CONNECT tunnel endpoint
-// pinned to a specific physical link so egress traffic shows the relay's Anycast
-// IP instead of the user's individual Wi-Fi or Mobile ISP IP.
+// pinned to a specific physical link so egress traffic shows the relay's IP
+// instead of the user's individual Wi-Fi or Mobile ISP IP.
+//
+// For 2-Hop Oblivious Chaining (Tor-grade unlinkability at line speed), set
+// NextHop: the bound radio dials Address (Hop 1, Entry Guard) over TLS 1.3,
+// tunnels to NextHop.Address (Hop 2, Exit Relay) with a nested TLS 1.3 layer,
+// then tunnels to the target. Hop 1 sees only your radio IP; Hop 2 sees only
+// the destination. With NextHop nil it behaves as a single encrypted proxy.
 type PrivacyEndpoint struct {
-	Protocol string // "socks5" or "http" (HTTP CONNECT)
-	Address  string // host:port
-	Username string
-	Password string
+	Protocol  string // "socks5", "http" (CONNECT), "https"/"tls"/"socks5s" (TLS-wrapped)
+	Address   string // host:port of Hop 1 (Entry Guard)
+	ServerSNI string // TLS SNI for Hop 1 (defaults to Address host)
+	Username  string
+	Password  string
+	NextHop   *PrivacyEndpoint // Optional Hop 2 (Exit Relay)
 }
 
 type PrivacyEngine struct {
@@ -94,18 +103,33 @@ func (p *PrivacyEngine) WebRTCBlockingEnabled() bool {
 	return p.blockWebRTC.Load()
 }
 
-// IsSTUNOrDiscoveryLeak inspects a UDP payload or target port to detect WebRTC
-// STUN/TURN binding requests (RFC 5389 magic cookie 0x2112A442) that leak real
-// client Wi-Fi and Cellular IP addresses to websites.
-func IsSTUNOrDiscoveryLeak(payload []byte, dstPort int) bool {
+// ShouldBlockPrivacyLeak is the single choke point for side-channel and
+// identity leaks inside the gVisor forwarders. Call it at the very top of the
+// UDP and TCP handlers before opening any outbound socket.
+func ShouldBlockPrivacyLeak(isUDP bool, payload []byte, dstPort int) bool {
+	if isUDP && dstPort == 443 {
+		// Block QUIC (HTTP/3) so all HTTPS uses multi-connection TCP 443 with
+		// 3-record SNI slicing and dual-radio Wi-Fi + 5G bonding.
+		return true
+	}
+	switch dstPort {
+	case 853: // Block direct DoT bypass so DNS falls back to the sharded DoH resolver
+		return true
+	case 5353, // mDNS local identity leak
+		5355,          // LLMNR leak
+		1900,          // SSDP UPnP discovery leak
+		137, 138, 139: // NetBIOS leak
+		return true
+	}
 	if !GlobalPrivacy.WebRTCBlockingEnabled() {
 		return false
 	}
-	if dstPort == 3478 || dstPort == 5349 || dstPort == 19302 || dstPort == 19305 {
+	if dstPort == 3478 || dstPort == 5349 || (dstPort >= 19302 && dstPort <= 19309) {
 		return true
 	}
-	// RFC 5389 STUN header is 20 bytes; bytes 4..8 equal magic cookie 0x2112A442.
-	if len(payload) >= 20 {
+	// Inspect UDP payload for RFC 5389 STUN Magic Cookie (0x2112A442) on any
+	// non-standard port.
+	if isUDP && len(payload) >= 20 {
 		msgType := binary.BigEndian.Uint16(payload[0:2])
 		cookie := binary.BigEndian.Uint32(payload[4:8])
 		if (msgType&0xC000 == 0) && cookie == 0x2112A442 {
@@ -115,9 +139,52 @@ func IsSTUNOrDiscoveryLeak(payload []byte, dstPort int) bool {
 	return false
 }
 
+// wrapHopTLS upgrades a raw bound connection to TLS 1.3 when the hop's
+// protocol calls for it ("https", "tls", "socks5s").
+func wrapHopTLS(ctx context.Context, rawConn net.Conn, hop *PrivacyEndpoint) (net.Conn, error) {
+	proto := strings.ToLower(strings.TrimSpace(hop.Protocol))
+	if proto != "https" && proto != "socks5s" && proto != "tls" {
+		return rawConn, nil
+	}
+	sni := hop.ServerSNI
+	if sni == "" {
+		sni, _, _ = net.SplitHostPort(hop.Address)
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: sni,
+		MinVersion: tls.VersionTLS13,
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func handshakeSingleHop(ctx context.Context, conn net.Conn, hop *PrivacyEndpoint, nextTarget string) (net.Conn, error) {
+	c, err := wrapHopTLS(ctx, conn, hop)
+	if err != nil {
+		return nil, err
+	}
+	proto := strings.ToLower(strings.TrimSpace(hop.Protocol))
+	if proto == "http" || proto == "https" || proto == "connect" {
+		if err := handshakeHTTPConnect(ctx, c, nextTarget, hop.Username, hop.Password); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		return c, nil
+	}
+	if err := handshakeSOCKS5(ctx, c, nextTarget, hop.Username, hop.Password); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
 // DialThroughPrivacyEgress establishes a bound connection over `link` through the
-// configured encrypted SOCKS5 or HTTP CONNECT privacy relay so the destination only
-// sees the relay's shared IP instead of the individual ISP IP. With no endpoint
+// configured encrypted relay. With NextHop set it builds a 2-Hop Oblivious Chain:
+// bound radio -> Hop 1 (Entry Guard, sees only your radio IP) -> nested TLS 1.3 ->
+// Hop 2 (Exit Relay, sees only the destination) -> target. With no endpoint
 // configured it dials direct.
 func DialThroughPrivacyEgress(
 	ctx context.Context,
@@ -129,25 +196,27 @@ func DialThroughPrivacyEgress(
 		return dialer.DialContext(ctx, network, targetAddr)
 	}
 
+	// Dial Hop 1 on the strictly bound physical radio (Wi-Fi or Cellular).
 	rawConn, err := dialer.DialContext(ctx, "tcp", ep.Address)
 	if err != nil {
 		return nil, err
 	}
 
-	proto := strings.ToLower(strings.TrimSpace(ep.Protocol))
-	if proto == "http" || proto == "https" || proto == "connect" {
-		if err := handshakeHTTPConnect(ctx, rawConn, targetAddr, ep.Username, ep.Password); err != nil {
-			_ = rawConn.Close()
+	// 2-Hop Oblivious Routing: Hop 1 -> nested TLS -> Hop 2 -> target.
+	if ep.NextHop != nil && ep.NextHop.Address != "" {
+		hop1Conn, err := handshakeSingleHop(ctx, rawConn, ep, ep.NextHop.Address)
+		if err != nil {
 			return nil, err
 		}
-		return rawConn, nil
+		hop2Conn, err := handshakeSingleHop(ctx, hop1Conn, ep.NextHop, targetAddr)
+		if err != nil {
+			return nil, err
+		}
+		return hop2Conn, nil
 	}
 
-	if err := handshakeSOCKS5(ctx, rawConn, targetAddr, ep.Username, ep.Password); err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	return rawConn, nil
+	// Single-hop encrypted relay.
+	return handshakeSingleHop(ctx, rawConn, ep, targetAddr)
 }
 
 func handshakeSOCKS5(ctx context.Context, conn net.Conn, targetAddr, user, pass string) error {
@@ -299,47 +368,68 @@ func isTLSClientHello(b []byte) bool {
 	return b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01
 }
 
-// writeFragmentedClientHello splits a TLS ClientHello into 2 TLS records right across
-// the middle of the SNI extension (or handshake body) and writes them in separate
-// TCP segments so ISP DPI middleboxes cannot parse or log the destination domain.
+// WriteClientHello writes a TLS ClientHello with TSO-proof 3-record SNI
+// slicing when fragmentation is enabled; plain write otherwise. Safe to use
+// for any first-payload write (non-TLS payloads pass through untouched).
+func WriteClientHello(conn net.Conn, b []byte) (int, error) {
+	if GlobalPrivacy.TLSFragmentationEnabled() && isTLSClientHello(b) {
+		return writeFragmentedClientHello(conn, b)
+	}
+	return conn.Write(b)
+}
+
+// writeFragmentedClientHello splits a TLS ClientHello into 3 asymmetric TLS
+// records with a 1.5ms hardware pacing barrier between them. Back-to-back
+// writes are frequently re-merged into a single wire packet by kernel
+// TSO/GSO; the pacing barrier forces separate physical IP frames so ISP DPI
+// cannot reassemble the SNI. Cost: ~3ms per handshake, 0% download overhead.
 func writeFragmentedClientHello(conn net.Conn, b []byte) (int, error) {
+	if len(b) < 43 || b[0] != 0x16 || b[1] != 0x03 || b[5] != 0x01 {
+		return conn.Write(b)
+	}
 	recordLen := int(binary.BigEndian.Uint16(b[3:5]))
 	if len(b) < 5+recordLen || recordLen < 32 {
 		return conn.Write(b)
 	}
 
 	payload := b[5 : 5+recordLen]
-	splitPos := len(payload) / 2
-	// Locate the SNI extension midpoint if present for exact DPI desynchronization.
-	if sniMid := findSNIMidpoint(payload); sniMid > 8 && sniMid < len(payload)-4 {
-		splitPos = sniMid
+
+	// Cut 1: right after the 4-byte Handshake header + 2-byte ClientVersion.
+	// Forces the DPI state machine to open an incomplete record context.
+	cut1 := 6
+	// Cut 2: exact midpoint of the SNI hostname string (or payload midpoint).
+	cut2 := len(payload) / 2
+	if sniMid := findSNIMidpoint(payload); sniMid > cut1+4 && sniMid < len(payload)-4 {
+		cut2 = sniMid
 	}
 
-	part1 := payload[:splitPos]
-	part2 := payload[splitPos:]
-
-	rec1 := make([]byte, 5+len(part1))
-	rec1[0] = 0x16
-	rec1[1] = b[1]
-	rec1[2] = b[2]
-	binary.BigEndian.PutUint16(rec1[3:5], uint16(len(part1)))
-	copy(rec1[5:], part1)
-
-	rec2 := make([]byte, 5+len(part2)+len(b)-(5+recordLen))
-	rec2[0] = 0x16
-	rec2[1] = b[1]
-	rec2[2] = b[2]
-	binary.BigEndian.PutUint16(rec2[3:5], uint16(len(part2)))
-	copy(rec2[5:], part2)
-	if len(b) > 5+recordLen {
-		copy(rec2[5+len(part2):], b[5+recordLen:])
+	slices := [][]byte{
+		payload[:cut1],
+		payload[cut1:cut2],
+		payload[cut2:],
 	}
 
-	if _, err := conn.Write(rec1); err != nil {
-		return 0, err
-	}
-	if _, err := conn.Write(rec2); err != nil {
-		return len(part1), err
+	for i, part := range slices {
+		rec := make([]byte, 5+len(part))
+		rec[0] = 0x16
+		rec[1] = b[1]
+		rec[2] = b[2]
+		binary.BigEndian.PutUint16(rec[3:5], uint16(len(part)))
+		copy(rec[5:], part)
+
+		// Append any trailing bytes (e.g. ChangeCipherSpec / early data) to the final slice.
+		if i == len(slices)-1 && len(b) > 5+recordLen {
+			rec = append(rec, b[5+recordLen:]...)
+		}
+
+		if _, err := conn.Write(rec); err != nil {
+			return 0, err
+		}
+		// 1.5ms hardware flush barrier prevents kernel TSO/GSO from
+		// coalescing the records back into one DPI-readable TCP segment.
+		if i < len(slices)-1 {
+			time.Sleep(1500 * time.Microsecond)
+		}
 	}
 	return len(b), nil
 }

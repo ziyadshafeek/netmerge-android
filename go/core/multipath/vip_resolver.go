@@ -100,27 +100,54 @@ type VIPResolver struct {
 	domToVIP map[string]*domainVIPRing
 	nextVIP  atomic.Uint32
 
-	binder        SocketBinder
-	dohClientWiFi *http.Client
-	dohClientCell *http.Client
-	resolve       func(ctx context.Context, domain string) (string, string)
+	binder     SocketBinder
+	dohClients map[string]*http.Client // DoH endpoint URL -> persistent bound HTTP/2 client
+	dohNext    atomic.Uint64           // round-robin sharding across DoH authorities
+	resolve    func(ctx context.Context, domain string) (string, string)
+}
+
+// Zero-log DoH authorities for query sharding: no single provider sees the
+// full browsing graph. Round-robin per query across independent operators.
+type dohProvider struct {
+	url string
+	sni string
+}
+
+var dohProvidersWiFi = []dohProvider{
+	{url: "https://1.1.1.1/dns-query", sni: "cloudflare-dns.com"},
+	{url: "https://9.9.9.9/dns-query", sni: "dns.quad9.net"},
+	{url: "https://1.0.0.1/dns-query", sni: "cloudflare-dns.com"},
+}
+
+var dohProvidersCell = []dohProvider{
+	{url: "https://[2606:4700:4700::1111]/dns-query", sni: "cloudflare-dns.com"},
+	{url: "https://[2620:fe::fe]/dns-query", sni: "dns.quad9.net"},
+	{url: "https://1.1.1.1/dns-query", sni: "cloudflare-dns.com"},
 }
 
 func NewVIPResolver(binder SocketBinder) *VIPResolver {
 	r := &VIPResolver{
-		vipToDom:      make(map[uint32]*DualEndpoint),
-		domToVIP:      make(map[string]*domainVIPRing),
-		binder:        binder,
-		dohClientWiFi: newBoundDoHClient(binder, LinkWiFi),
-		dohClientCell: newBoundDoHClient(binder, LinkCellular),
+		vipToDom:   make(map[uint32]*DualEndpoint),
+		domToVIP:   make(map[string]*domainVIPRing),
+		binder:     binder,
+		dohClients: make(map[string]*http.Client),
+	}
+	// One persistent HTTP/2 TLS 1.3 client per (radio, authority) so DNS
+	// queries never leak file descriptors and each uses the correct SNI.
+	for _, p := range dohProvidersWiFi {
+		r.dohClients[p.url] = newBoundDoHClient(binder, LinkWiFi, p.sni)
+	}
+	for _, p := range dohProvidersCell {
+		r.dohClients[p.url] = newBoundDoHClient(binder, LinkCellular, p.sni)
 	}
 	r.nextVIP.Store(firstVIP)
 	return r
 }
 
 // newBoundDoHClient creates a persistent HTTP/2 TLS 1.3 client strictly bound
-// to a single physical radio so DNS queries never leak file descriptors.
-func newBoundDoHClient(binder SocketBinder, link LinkType) *http.Client {
+// to a single physical radio with the authority's SNI so DNS queries never
+// leak file descriptors and TLS authenticates the right hostname.
+func newBoundDoHClient(binder SocketBinder, link LinkType, sni string) *http.Client {
 	dialer := NewBoundDialer(binder, link, 1200*time.Millisecond)
 	tr := &http.Transport{
 		DialContext:         dialer.DialContext,
@@ -130,7 +157,7 @@ func newBoundDoHClient(binder SocketBinder, link LinkType) *http.Client {
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 900 * time.Millisecond,
 		TLSClientConfig: &tls.Config{
-			ServerName: "cloudflare-dns.com",
+			ServerName: sni,
 			MinVersion: tls.VersionTLS13,
 		},
 	}
@@ -384,31 +411,24 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 		ips      []net.IP
 		priority int
 	}
-	outCh := make(chan dnsOut, 4)
+	outCh := make(chan dnsOut, 2)
 
-	// 1. Encrypted DoH over persistent bound HTTP/2 client (zero FD leak).
-	go func() {
-		ips := r.queryDoHOnLink(ctx, domain, qtypes[0], link)
-		if len(ips) > 0 {
-			outCh <- dnsOut{ips: ips, priority: 1}
-		}
-	}()
-
-	// 2. Parallel UDP race across primary & secondary DNS resolvers on bound link.
+	// 1. ZERO-LEAK ENCRYPTED DoH FIRST: race A and AAAA strictly over encrypted
+	// DoH, sharded across independent authorities. Plaintext UDP port 53 is
+	// NEVER transmitted during normal operation - the ISP sees zero DNS.
 	for idx, qt := range qtypes {
 		go func(qtype uint16, prio int) {
-			ips := r.queryUDPOnLink(ctx, domain, qtype, link)
-			if len(ips) > 0 {
+			if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
 				outCh <- dnsOut{ips: ips, priority: prio}
 			}
 		}(qt, idx+1)
 	}
 
-	timeout := time.NewTimer(900 * time.Millisecond)
-	defer timeout.Stop()
+	dohTimer := time.NewTimer(650 * time.Millisecond)
+	defer dohTimer.Stop()
 
 	var fallback []net.IP
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		select {
 		case res := <-outCh:
 			if res.priority == 1 {
@@ -417,13 +437,20 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 			if len(fallback) == 0 {
 				fallback = res.ips
 			}
-		case <-timeout.C:
-			return fallback
+		case <-dohTimer.C:
+			if len(fallback) > 0 {
+				return fallback
+			}
+			// Only if encrypted DoH is completely unreachable, try emergency plaintext fallback.
+			return r.queryUDPOnLink(ctx, domain, qtypes[0], link)
 		case <-ctx.Done():
 			return fallback
 		}
 	}
-	return fallback
+	if len(fallback) > 0 {
+		return fallback
+	}
+	return r.queryUDPOnLink(ctx, domain, qtypes[0], link)
 }
 
 func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {
@@ -431,45 +458,46 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 	if len(wireReq) == 0 {
 		return nil
 	}
-	dohURL := "https://1.1.1.1/dns-query"
-	client := r.dohClientWiFi
+	providers := dohProvidersWiFi
 	if link == LinkCellular {
-		dohURL = "https://[2606:4700:4700::1111]/dns-query"
-		client = r.dohClientCell
+		providers = dohProvidersCell
 	}
-	if client == nil {
+	if len(providers) == 0 {
 		return nil
 	}
+	// Round-robin sharding: consecutive queries spread across independent
+	// zero-log authorities so no single provider sees the full query graph.
+	start := int(r.dohNext.Add(1) % uint64(len(providers)))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dohURL, bytes.NewReader(wireReq))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/dns-message")
-	req.Header.Set("Accept", "application/dns-message")
-
-	resp, err := client.Do(req)
-	if err != nil && link == LinkCellular {
-		// Fallback to IPv4 DoH endpoint on Cellular if carrier uses CLAT/IPv4.
-		reqV4, errReq := http.NewRequestWithContext(ctx, http.MethodPost, "https://1.1.1.1/dns-query", bytes.NewReader(wireReq))
-		if errReq == nil {
-			reqV4.Header.Set("Content-Type", "application/dns-message")
-			reqV4.Header.Set("Accept", "application/dns-message")
-			resp, err = client.Do(reqV4)
+	for attempt := 0; attempt < len(providers); attempt++ {
+		p := providers[(start+attempt)%len(providers)]
+		client := r.dohClients[p.url]
+		if client == nil {
+			continue
 		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(wireReq))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/dns-message")
+		req.Header.Set("Accept", "application/dns-message")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue // try next authority (e.g. IPv6 DoH unreachable on CLAT carriers)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		status := resp.StatusCode
+		resp.Body.Close()
+		if err != nil || status != http.StatusOK {
+			continue
+		}
+		if ips := parseDNSResponsePacket(body, txID); len(ips) > 0 {
+			return ips
+		}
+		// Empty answer: try next authority rather than failing over to plaintext.
 	}
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		return nil
-	}
-	return parseDNSResponsePacket(body, txID)
+	return nil
 }
 
 func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {

@@ -170,13 +170,13 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 	activeLink := primaryLink
 
 	if n > 0 {
-		if _, wErr := activeUpstream.Write(firstPayload[:n]); wErr != nil {
+		if _, wErr := WriteClientHello(activeUpstream, firstPayload[:n]); wErr != nil {
 			MarkLinkStalled(activeLink, 3*time.Second)
 			if sbConn, sbLink := popStandby(); sbConn != nil {
 				activeUpstream.Close()
 				activeUpstream = sbConn
 				activeLink = sbLink
-				if _, wErr2 := activeUpstream.Write(firstPayload[:n]); wErr2 != nil {
+				if _, wErr2 := WriteClientHello(activeUpstream, firstPayload[:n]); wErr2 != nil {
 					activeUpstream.Close()
 					return wErr2
 				}
@@ -214,7 +214,7 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 					activeUpstream.Close()
 					activeUpstream = sbConn
 					activeLink = sbLink
-					if _, err := activeUpstream.Write(firstPayload[:n]); err != nil {
+					if _, err := WriteClientHello(activeUpstream, firstPayload[:n]); err != nil {
 						activeUpstream.Close()
 						return err
 					}

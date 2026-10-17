@@ -243,6 +243,15 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 	host := tcpipToIP(id.LocalAddress).String()
 	port := uint16(id.LocalPort)
 
+	// Privacy leak lockdown on the TCP path (DoT bypass, NetBIOS): reject
+	// before CreateEndpoint so the stack answers RST and the app falls back
+	// to the sharded DoH resolver. (TCP 443 is unaffected: only UDP 443/QUIC
+	// is blocked, forcing multi-connection TCP where SNI slicing applies.)
+	if multipath.ShouldBlockPrivacyLeak(false, nil, int(port)) {
+		r.Complete(true)
+		return
+	}
+
 	var wq waiter.Queue
 	ep, terr := r.CreateEndpoint(&wq)
 	if terr != nil {
@@ -368,24 +377,13 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 	dstIP := tcpipToIP(id.LocalAddress)
 	dstHost, dstPort := dstIP.String(), int(id.LocalPort)
 
-	// Block QUIC (UDP/443), DNS-over-TLS (UDP/853), and any non-DNS UDP to
-	// synthetic 198.18.0.0/15 VIPs BEFORE CreateEndpoint so gVisor emits
-	// ICMP Port Unreachable. Chrome/YouTube get ECONNREFUSED and fall back
-	// to TCP/443 in <1ms instead of blackholing.
-	// Note: ALL UDP/443 is blocked (not just to VIPs) because:
-	// - QUIC only falls back to TCP during handshake, not mid-download
-	// - ElephantQUICGuard would kill established QUIC mid-stream (10-30s stall)
-	// - Chrome caches real IPs from before VPN start (bypasses VIPs)
-	// - Every QUIC server also speaks TCP/443 (HTTP/3 spec requirement)
-	if dstPort == 443 || dstPort == 853 || (dstPort != 53 && isSyntheticVIP(dstIP)) {
-		return false
-	}
-
-	// WebRTC STUN/TURN leak blocker: binding requests on STUN ports would expose
-	// the real Wi-Fi/Cellular IPs to the website. Drop them here so WebRTC falls
-	// back to TURN over TCP/443, which the multipath engine compounds.
-	// (Port-based: the datagram payload isn't visible before CreateEndpoint.)
-	if multipath.IsSTUNOrDiscoveryLeak(nil, dstPort) {
+	// Privacy leak lockdown + QUIC/DoT blocking BEFORE CreateEndpoint so gVisor
+	// emits ICMP Port Unreachable and apps fall back in <1ms:
+	// - UDP 443 (QUIC): forces multi-connection TCP 443 (SNI slicing + bonding)
+	// - 853 (DoT): forces fallback to the sharded DoH VIP resolver
+	// - 5353/5355/1900/137-139 (mDNS/LLMNR/SSDP/NetBIOS): blocks LAN identity leaks
+	// - STUN/TURN ports: blocks WebRTC IP leaks (falls back to TURN/TCP)
+	if multipath.ShouldBlockPrivacyLeak(true, nil, dstPort) || (dstPort != 53 && isSyntheticVIP(dstIP)) {
 		return false
 	}
 
