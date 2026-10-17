@@ -13,6 +13,8 @@ type OnPhoneCompoundEngine struct {
 	Splicer   *HalvingSplicer
 	QUICGuard *ElephantQUICGuard
 	DNS       *DNSInterceptor
+	MPSched   *Scheduler
+	Racer     *Racer
 }
 
 // NewOnPhoneCompoundEngine creates a compounding engine. The binder is the
@@ -20,6 +22,7 @@ type OnPhoneCompoundEngine struct {
 // dials will fail).
 func NewOnPhoneCompoundEngine(binder SocketBinder) *OnPhoneCompoundEngine {
 	resolver := NewVIPResolver(binder)
+	sched := NewScheduler()
 	return &OnPhoneCompoundEngine{
 		Binder:    binder,
 		Resolver:  resolver,
@@ -27,5 +30,7 @@ func NewOnPhoneCompoundEngine(binder SocketBinder) *OnPhoneCompoundEngine {
 		Splicer:   NewHalvingSplicer(binder),
 		QUICGuard: NewElephantQUICGuard(),
 		DNS:       NewDNSInterceptor(resolver),
+		MPSched:   sched,
+		Racer:     NewRacer(binder, resolver, sched),
 	}
 }

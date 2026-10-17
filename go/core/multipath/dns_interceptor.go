@@ -73,7 +73,7 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
-	vip, _ := d.resolver.GetOrAllocateVIP(ctx, hostname)
+	vip, _ := d.resolver.GetOrAllocate(ctx, hostname)
 	if vip == nil {
 		return nil
 	}
@@ -102,5 +102,8 @@ func (d *DNSInterceptor) LookupVIP(ipStr string) *DualEndpoint {
 	if ip == nil {
 		return nil
 	}
-	return d.resolver.EndpointForVIP(ip)
+	if ep, ok := d.resolver.LookupVIP(ip); ok {
+		return ep
+	}
+	return nil
 }

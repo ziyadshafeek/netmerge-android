@@ -99,8 +99,15 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 	raceCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// preferred = 0 -> uses StripedPreferredLink() (Real-Time Rolling Byte-Credit Scheduler!)
-	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, 0)
+	// Preferred link from the BDP-aware multipath scheduler (deficit
+	// inverse-completion-time water-filling). The speculative dual-dial still
+	// races both radios; the preference only biases its 45ms grace window,
+	// so a wrong pick costs nothing.
+	var preferred LinkType
+	if e.MPSched != nil {
+		preferred, _, _ = e.MPSched.SelectLinks(256 * 1024)
+	}
+	primaryConn, primaryLink, standbyCh, err := DialSpeculativeDualLink(raceCtx, e.Binder, ep, port, preferred)
 	if err != nil {
 		return err
 	}
@@ -269,6 +276,22 @@ func (e *OnPhoneCompoundEngine) passThroughHTTP(
 	return e.ForwardWithMidHandshakeReplay(ctx, clientConn, replayed, ep, port)
 }
 
+// dialSplicerLink opens a metered, scheduler-fed connection pinned to one link
+// for HTTP range-splicer workers. Every byte feeds the BDP scheduler's per-link
+// goodput/RTT estimates and re-arms TCP_QUICKACK, so the scheduler learns real
+// radio capacity from bulk traffic. Falls back to the plain bound dialer when
+// the racer is unavailable (unit tests) or the metered dial fails.
+func (e *OnPhoneCompoundEngine) dialSplicerLink(ctx context.Context, link LinkType, ip, fallbackIP, port string) (net.Conn, error) {
+	if e.Racer != nil {
+		if portInt, err := strconv.Atoi(port); err == nil {
+			if mc, derr := e.Racer.DialLink(ctx, "tcp", link, ip, portInt); derr == nil {
+				return mc, nil
+			}
+		}
+	}
+	return DialLinkConn(ctx, e.Binder, link, ip, fallbackIP, port)
+}
+
 // compoundHTTPStream compounds a single HTTP GET (including explicit Range requests)
 // across BOTH Wi-Fi and Cellular simultaneously using 256 KB work-stealing micro-segments.
 func (e *OnPhoneCompoundEngine) compoundHTTPStream(
@@ -412,7 +435,7 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 			expected := int(sEnd - sStart + 1)
 
 			if conn == nil {
-				c, dErr := DialLinkConn(sctx, e.Binder, link, ip, fallbackIP, port)
+				c, dErr := e.dialSplicerLink(sctx, link, ip, fallbackIP, port)
 				if dErr != nil {
 					return nil, dErr
 				}
