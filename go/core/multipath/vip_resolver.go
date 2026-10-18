@@ -21,10 +21,43 @@ const (
 )
 
 var (
-	nat64PrefixMu sync.RWMutex
-	nat64Prefix   = [12]byte{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0}
-	nat64Probed   atomic.Bool
+	nat64PrefixMu     sync.RWMutex
+	nat64Prefix       = [12]byte{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0}
+	nat64Probed       atomic.Bool
+	nat64Verified     atomic.Bool
+	activeVIPResolver atomic.Pointer[VIPResolver]
 )
+
+func IsNAT64PrefixVerified() bool {
+	return nat64Verified.Load()
+}
+
+// NotifyNetworkHandover is called whenever Android reports a network/RAT change
+// (e.g. Jio 5G -> 4G). It purges dead 5G pre-warmed sockets, closes zombie HTTP/2
+// DoH connections, clears link stall timers, and marks cached endpoints for refresh.
+func NotifyNetworkHandover() {
+	PurgeWarmPool()
+	stalledUntil[LinkWiFi].Store(0)
+	stalledUntil[LinkCellular].Store(0)
+	nat64Verified.Store(false)
+	nat64Probed.Store(false)
+	if r := activeVIPResolver.Load(); r != nil {
+		for _, client := range r.dohClients {
+			if client != nil {
+				client.CloseIdleConnections()
+			}
+		}
+		r.mu.RLock()
+		for _, ring := range r.domToVIP {
+			if ring != nil && ring.ep != nil {
+				ring.ep.mu.Lock()
+				ring.ep.Updated = time.Time{} // Force background refresh on next query
+				ring.ep.mu.Unlock()
+			}
+		}
+		r.mu.RUnlock()
+	}
+}
 
 func SynthesizeCarrierNAT64(ip4 net.IP) string {
 	v4 := ip4.To4()
@@ -134,10 +167,10 @@ var dohProvidersWiFi = []dohProvider{
 }
 
 var dohProvidersCell = []dohProvider{
-	{url: "https://[2606:4700:4700::1111]/dns-query", sni: "cloudflare-dns.com"},
-	{url: "https://[2620:fe::fe]/dns-query", sni: "dns.quad9.net"},
 	{url: "https://1.1.1.1/dns-query", sni: "cloudflare-dns.com"},
+	{url: "https://[2606:4700:4700::1111]/dns-query", sni: "cloudflare-dns.com"},
 	{url: "https://9.9.9.9/dns-query", sni: "dns.quad9.net"},
+	{url: "https://[2620:fe::fe]/dns-query", sni: "dns.quad9.net"},
 }
 
 func dohClientKey(link LinkType, url string) string {
@@ -161,6 +194,7 @@ func NewVIPResolver(binder SocketBinder) *VIPResolver {
 		r.dohClients[dohClientKey(LinkCellular, p.url)] = newBoundDoHClient(binder, LinkCellular, p.sni)
 	}
 	r.nextVIP.Store(firstVIP)
+	activeVIPResolver.Store(r)
 	return r
 }
 
@@ -189,16 +223,17 @@ func (r *VIPResolver) maybeDiscoverNAT64Prefix() {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		// Verify whether 64:ff9b::101:101:443 is actually routable on this carrier
+		// before enabling NAT64 dual-exit striping.
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
 		defer cancel()
-		ips := r.lookupOnLink(ctx, "ipv4only.arpa", LinkCellular, true)
-		for _, ip := range ips {
-			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
-				nat64PrefixMu.Lock()
-				copy(nat64Prefix[:], v6[0:12])
-				nat64PrefixMu.Unlock()
-				return
-			}
+		d := NewBoundDialer(r.binder, LinkCellular, 1000*time.Millisecond)
+		c, err := d.DialContext(ctx, "tcp6", "[64:ff9b::101:101]:443")
+		if err == nil && c != nil {
+			_ = c.Close()
+			nat64Verified.Store(true)
+		} else {
+			nat64Verified.Store(false)
 		}
 	}()
 }
@@ -625,8 +660,12 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		if client == nil {
 			continue
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(wireReq))
+		// Per-provider 500ms cap: prevents a dead 5G HTTP/2 socket on attempt 0
+		// from consuming the entire lookupOnLink budget!
+		reqCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, p.url, bytes.NewReader(wireReq))
 		if err != nil {
+			cancel()
 			continue
 		}
 		req.Header.Set("Content-Type", "application/dns-message")
@@ -634,12 +673,18 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		req.Header.Set("X-Padding", padHeader)
 		resp, err := client.Do(req)
 		if err != nil {
+			cancel()
+			// CRITICAL: Immediately purge dead 5G HTTP/2 connections from the
+			// transport pool so the next DNS query dials a fresh 4G socket!
+			client.CloseIdleConnections()
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		status := resp.StatusCode
 		resp.Body.Close()
+		cancel()
 		if err != nil || status != http.StatusOK {
+			client.CloseIdleConnections()
 			continue
 		}
 		if ips := parseDNSResponsePacket(body, txID); len(ips) > 0 {

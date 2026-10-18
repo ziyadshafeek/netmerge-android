@@ -160,6 +160,28 @@ func PutWarmConn(link LinkType, ip, port string, c net.Conn) {
 	warmMu.Unlock()
 }
 
+// PurgeWarmPool closes and removes all pre-warmed sockets (called when
+// cellular switches 5G <-> 4G or a link's IP changes).
+func PurgeWarmPool() {
+	warmMu.Lock()
+	defer warmMu.Unlock()
+	for k, list := range warmPool {
+		for _, wc := range list {
+			_ = wc.conn.Close()
+		}
+		delete(warmPool, k)
+	}
+}
+
+// wrapMorph returns c wrapped in MorphingConn, skipping the wrap when c is
+// already wrapped (warmPool mixes raw and previously-wrapped standby conns).
+func wrapMorph(c net.Conn, link LinkType) net.Conn {
+	if _, ok := c.(*MorphingConn); ok {
+		return c
+	}
+	return WrapMorphingConn(c, link)
+}
+
 func toNAT64(ip4 net.IP) string {
 	ip4 = ip4.To4()
 	if ip4 == nil {
@@ -180,35 +202,30 @@ type raceResult struct {
 // and sets TCP_NODELAY.
 var cellDualExitToggle atomic.Uint64
 
-// DialLinkConn dials a single link, routing through the link's configured
-// Orthogonal Privacy Egress if present, or striping Cellular IPv4 connections
-// across both the Carrier's Hardware NAT64 Border Exit and native CGNAT IPv4.
+// DialLinkConn dials a single link with automatic Jio 4G/5G IPv6 <-> 464XLAT IPv4
+// failover so a 5G -> 4G handover never stalls on dead sockets or unrouted NAT64.
 // Every returned connection is wrapped in MorphingConn for L4 stream morphing.
 func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, fallbackIPv4, port string) (net.Conn, error) {
 	if c := popWarmConn(link, ip, port); c != nil {
-		return WrapMorphingConn(c, link), nil
+		return wrapMorph(c, link), nil
 	}
-	d := NewBoundDialer(binder, link, 4*time.Second)
-	egress := GlobalPrivacy.EgressForLink(link)
-	// If an Orthogonal Privacy Egress relay is configured for this radio,
-	// route through the camouflaged tunnel so the destination website never
-	// sees the client IP while preserving dual-radio bandwidth compounding.
-	if egress != nil && egress.Address != "" {
+	d := NewBoundDialer(binder, link, 3500*time.Millisecond)
+	if egress := GlobalPrivacy.EgressForLink(link); egress != nil && egress.Address != "" {
 		c, err := DialThroughPrivacyEgress(ctx, d, egress, "tcp", net.JoinHostPort(ip, port))
 		if err == nil && c != nil {
 			armKeepAlive(c)
-			return WrapMorphingConn(c, link), nil
+			return wrapMorph(c, link), nil
 		}
 		return nil, err
 	}
-	// Zero-VPS Direct Mode: ISP-Level Dual-Exit Striping on Cellular alternates
-	// between the Carrier's Hardware NAT64 Border Gateway (64:ff9b::/96) and
-	// local CGNAT IPv4, with instant fallback on IPv4-only SIMs.
-	if link == LinkCellular {
+	// Only stripe across Carrier NAT64 if the NAT64 prefix has been verified
+	// reachable on this cellular network (prevents 1100ms timeouts on Jio 4G
+	// where 64:ff9b::/96 is unrouted and 464XLAT/clatd handles IPv4).
+	if link == LinkCellular && IsNAT64PrefixVerified() {
 		parsed := net.ParseIP(ip)
 		if parsed != nil && parsed.To4() != nil && cellDualExitToggle.Add(1)%2 == 0 {
 			if nat64 := SynthesizeCarrierNAT64(parsed); nat64 != "" {
-				natCtx, cancel := context.WithTimeout(ctx, 1100*time.Millisecond)
+				natCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 				c, err := d.DialContext(natCtx, "tcp", net.JoinHostPort(nat64, port))
 				cancel()
 				if err == nil && c != nil {
@@ -216,20 +233,34 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 						_ = tc.SetNoDelay(true)
 					}
 					armKeepAlive(c)
-					return WrapMorphingConn(c, link), nil
+					return wrapMorph(c, link), nil
 				}
 			}
 		}
 	}
 	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 	if err != nil && link == LinkCellular {
-		targetIP4 := net.ParseIP(ip)
-		if targetIP4 == nil || targetIP4.To4() == nil {
-			targetIP4 = net.ParseIP(fallbackIPv4)
+		// Evict any stale 5G sockets cached in warmPool when a cellular dial fails.
+		PurgeWarmPool()
+		parsedIP := net.ParseIP(ip)
+		// 1. If primary cellular target was IPv6 and failed (common during Jio
+		// 5G -> 4G switch), immediately try raw IPv4 via Android 464XLAT (clatd)!
+		if (parsedIP == nil || parsedIP.To4() == nil) && fallbackIPv4 != "" {
+			if fb4 := net.ParseIP(fallbackIPv4); fb4 != nil && fb4.To4() != nil {
+				c, err = d.DialContext(ctx, "tcp", net.JoinHostPort(fb4.String(), port))
+			}
 		}
-		if targetIP4 != nil && targetIP4.To4() != nil {
-			nat64 := SynthesizeCarrierNAT64(targetIP4)
-			c, err = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
+		// 2. If raw IPv4 also failed (CLAT still warming up), try synthesized NAT64.
+		if err != nil && IsNAT64PrefixVerified() {
+			targetIP4 := parsedIP
+			if targetIP4 == nil || targetIP4.To4() == nil {
+				targetIP4 = net.ParseIP(fallbackIPv4)
+			}
+			if targetIP4 != nil && targetIP4.To4() != nil {
+				if nat64 := SynthesizeCarrierNAT64(targetIP4); nat64 != "" {
+					c, err = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
+				}
+			}
 		}
 	}
 	if err == nil && c != nil {
@@ -237,9 +268,9 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 			_ = tc.SetNoDelay(true)
 		}
 		armKeepAlive(c)
-		return WrapMorphingConn(c, link), nil
+		return wrapMorph(c, link), nil
 	}
-	return nil, err
+	return c, err
 }
 
 // DialSpeculativeDualLink dials Wi-Fi and Cellular for a new flow. When stagger > 0
@@ -264,6 +295,15 @@ func DialSpeculativeDualLink(
 	// edge IPs so consecutive flows spread over the CDN's full edge set.
 	_, _ = ep.WaitReady(ctx)
 	wifiAddr, cellAddr := ep.NextAddrs()
+	ep.mu.RLock()
+	cellRawV4 := ep.CellRawV4
+	ep.mu.RUnlock()
+	if cellRawV4 == "" {
+		if parsedW := net.ParseIP(wifiAddr); parsedW != nil && parsedW.To4() != nil {
+			cellRawV4 = wifiAddr
+		}
+	}
+	savedWiFi, savedCell := wifiAddr, cellAddr
 	// STRICT single-radio check: the resolver mirrors the working radio's IP
 	// into the dead radio's field (and the dial fallback routes it out the
 	// default network anyway), so a non-empty addr does NOT prove the radio is
@@ -274,6 +314,21 @@ func DialSpeculativeDualLink(
 	}
 	if cellAddr != "" && binder != nil && !binder.CanBindLink(int(LinkCellular)) {
 		cellAddr = ""
+	}
+	// CRITICAL JIO 5G -> 4G HANDOVER FIX:
+	// During a 5G -> 4G RAT switch on cellular-only mode, Android briefly drops
+	// the 5G Network callback (onLost) before registering the 4G Network ref,
+	// making CanBindLink false for BOTH links. Never return errNoAddr here:
+	// restore the cellular address so BindAndProtect's Protect(fd) fallback
+	// routes the socket over Android's active 4G default network!
+	if wifiAddr == "" && cellAddr == "" {
+		if savedCell != "" {
+			cellAddr = savedCell
+			preferred = LinkCellular
+		} else if savedWiFi != "" {
+			wifiAddr = savedWiFi
+			preferred = LinkWiFi
+		}
 	}
 	ch := make(chan raceResult, 2)
 
@@ -326,7 +381,12 @@ func DialSpeculativeDualLink(
 	}
 	if cellAddr != "" {
 		n++
-		go dialOne(LinkCellular, cellAddr, wifiAddr)
+		// Always pass cellRawV4 as fallbackIPv4 even when wifiAddr is "" (Wi-Fi off)!
+		cellFallback := cellRawV4
+		if cellFallback == "" {
+			cellFallback = wifiAddr
+		}
+		go dialOne(LinkCellular, cellAddr, cellFallback)
 	}
 	if n == 0 {
 		closedCh := make(chan raceResult)

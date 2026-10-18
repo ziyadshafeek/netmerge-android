@@ -440,9 +440,29 @@ func isTLSClientHello(b []byte) bool {
 
 func WriteClientHello(conn net.Conn, b []byte) (int, error) {
 	if GlobalPrivacy.TLSFragmentationEnabled() && isTLSClientHello(b) {
+		// Unwrap MorphingConn first (loop: warmPool can hand back an already-
+		// wrapped standby conn): writeFragmentedClientHello writes rec1 through
+		// conn.Write, which would re-trigger MorphingConn's firstWrite branch
+		// and fragment rec1 a second time (3-4 records, SNI split lost).
+		for {
+			mc, ok := conn.(*MorphingConn)
+			if !ok {
+				break
+			}
+			conn = mc.Conn
+		}
 		return writeFragmentedClientHello(conn, b)
 	}
 	return conn.Write(b)
+}
+
+// SyscallConn delegates to the inner connection so setSocketMaxSeg's
+// TCP_MAXSEG clamp works through the MorphingConn wrapper.
+func (mc *MorphingConn) SyscallConn() (syscall.RawConn, error) {
+	if sc, ok := mc.Conn.(syscall.Conn); ok {
+		return sc.SyscallConn()
+	}
+	return nil, errors.New("morphing: inner conn has no syscall conn")
 }
 
 // setSocketMaxSeg dynamically clamps TCP_MAXSEG during ClientHello slicing

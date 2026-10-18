@@ -27,19 +27,27 @@ func (b *protectorBinder) BindAndProtect(fd int64, networkType int) bool {
 	return true
 }
 
-// CanBindLink is the STRICT link-liveness probe: it calls the Kotlin
-// bindAndProtect WITHOUT the Protect fallback, so a dead radio (null
-// Network ref) reports false. Used for single- vs dual-radio decisions.
+// CanBindLink is the STRICT link-liveness probe: it checks both AF_INET and
+// AF_INET6 so IPv6-only cellular links (e.g. Jio 4G before 464XLAT/clatd
+// finishes attaching) are never falsely marked dead during 5G -> 4G handovers.
+// It calls the Kotlin bindAndProtect WITHOUT the Protect fallback, so a dead
+// radio (null Network ref) reports false. Used for single- vs dual-radio decisions.
 func (b *protectorBinder) CanBindLink(networkType int) bool {
 	if b.p == nil {
 		return false
 	}
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return true // cannot probe; assume the radio is up
+	for _, domain := range []int{syscall.AF_INET, syscall.AF_INET6} {
+		fd, err := syscall.Socket(domain, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			continue
+		}
+		ok := b.p.BindAndProtect(int(fd), networkType)
+		_ = syscall.Close(fd)
+		if ok {
+			return true
+		}
 	}
-	defer syscall.Close(fd)
-	return b.p.BindAndProtect(int(fd), networkType)
+	return false
 }
 
 // OnBytes wires VIP flow byte counters back to the Scheduler slots so the

@@ -112,3 +112,40 @@ func TestMorphingConnPreservesTLSAppDataStream(t *testing.T) {
 		t.Fatalf("MorphingConn altered encrypted TLS stream bytes!")
 	}
 }
+
+func TestWriteClientHelloOnMorphingConnSingleFragment(t *testing.T) {
+	// Regression test: WriteClientHello called on a MorphingConn (the real
+	// compound_engine.go path) must emit exactly 2 records, not re-fragment.
+	orig := BuildProbeClientHello("example.com")
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	mc := WrapMorphingConn(c1, LinkCellular)
+	var received []byte
+	done := make(chan error, 1)
+	go func() {
+		buf, err := io.ReadAll(c2)
+		received = buf
+		done <- err
+	}()
+	n, err := WriteClientHello(mc, orig)
+	_ = mc.Close()
+	if err != nil || n != len(orig) {
+		t.Fatalf("WriteClientHello failed: n=%d err=%v", n, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	records := 0
+	for offset := 0; offset < len(received); {
+		if offset+5 > len(received) {
+			t.Fatalf("truncated record header at %d", offset)
+		}
+		rLen := int(binary.BigEndian.Uint16(received[offset+3 : offset+5]))
+		offset += 5 + rLen
+		records++
+	}
+	if records != 2 {
+		t.Fatalf("double fragmentation: got %d TLS records, want exactly 2", records)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"netmerge/core/multipath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -239,10 +240,15 @@ func (s *Scheduler) Update(nets []NetworkInfo) {
 		old4, old6 := found.ip(Fam4), found.ip(Fam6)
 		if !ipEqual(old4, ip4) {
 			found.state[Fam4] = stateUnknown // new address: re-verify
+			found.downUntil[Fam4] = time.Time{}
 		}
 		if !ipEqual(old6, ip6) {
 			found.state[Fam6] = stateUnknown
+			found.downUntil[Fam6] = time.Time{}
 		}
+		// Clear cooldowns on any network update (e.g. Jio 5G -> 4G handover)
+		found.downUntil[Fam4] = time.Time{}
+		found.downUntil[Fam6] = time.Time{}
 		if ip4 != nil {
 			found.ip4.Store(&ip4)
 		} else {
@@ -261,6 +267,7 @@ func (s *Scheduler) Update(nets []NetworkInfo) {
 		}
 	}
 	s.slots = kept
+	multipath.NotifyNetworkHandover()
 }
 
 func ipEqual(a, b net.IP) bool {

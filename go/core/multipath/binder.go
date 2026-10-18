@@ -26,7 +26,7 @@ const (
 	tcpWindowClmp = 0xa  // TCP_WINDOW_CLAMP
 	ipTosDSCP     = 0x28 // Assured Forwarding AF11 / Low-Latency Throughput
 	ipv6TClass    = 0x43 // IPV6_TCLASS
-	cellSafeMSS   = 1360 // Prevents 5G NR GTP-U + NAT64/464XLAT PMTU blackholes
+	cellSafeMSS   = 1220 // Safe MSS for Jio 4G/5G 464XLAT (IPv6 1280 MTU - 40B IPv6 - 20B TCP)
 	wifiSafeMSS   = 1440 // Safe MSS for PPPoE/Fiber Wi-Fi uplinks
 	spliceBufSize = 256 * 1024
 )
