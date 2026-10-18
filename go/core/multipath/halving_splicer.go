@@ -65,16 +65,28 @@ type HalvingSplicer struct {
 	CellClient *http.Client
 }
 
+// targetAddrKey carries a per-request TCP dial override (ip:port) in the
+// request context, so the URL keeps the original hostname for TLS SNI and
+// X.509 verification while the socket is pinned to the chosen CDN edge IP.
+type targetAddrKey struct{}
+
 // NewHalvingSplicer builds a splicer whose upstream sockets are dialed
-// through the given binder (interface pinning + VPN protection).
+// through the given binder (interface pinning + VPN protection) and routes
+// to the per-link CDN edge IP stored in the request context while preserving
+// the original hostname for TLS SNI and X.509 certificate verification.
 func NewHalvingSplicer(binder SocketBinder) *HalvingSplicer {
 	makeClient := func(link LinkType) *http.Client {
 		dialer := NewBoundDialer(binder, link, 8*time.Second)
 		return &http.Client{
 			Transport: &http.Transport{
-				DialContext:           dialer.DialContext,
-				ForceAttemptHTTP2:     false, // HTTP/1.1: raw bytes, no multiplexing overhead
-				MaxIdleConnsPerHost:   4,
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					if override, ok := ctx.Value(targetAddrKey{}).(string); ok && override != "" {
+						addr = override
+					}
+					return DialBoundContext(ctx, dialer, network, addr)
+				},
+				ForceAttemptHTTP2:     false, // HTTP/1.1: independent TCP sockets per range worker
+				MaxIdleConnsPerHost:   6,
 				IdleConnTimeout:       30 * time.Second,
 				ResponseHeaderTimeout: 6 * time.Second,
 				ReadBufferSize:        64 * 1024,
@@ -86,6 +98,10 @@ func NewHalvingSplicer(binder SocketBinder) *HalvingSplicer {
 		CellClient: makeClient(LinkCellular),
 	}
 }
+
+// TargetAddrKey returns the context key used to override the dial address.
+// Exported for the loopback HTTPS splicer (package core).
+func TargetAddrKey() any { return targetAddrKey{} }
 
 // StreamWithDynamicHalving downloads [initialOffset, totalSize) and writes
 // the bytes in strict order to clientWriter. The resource is fetched in
@@ -373,17 +389,30 @@ func (hs *HalvingSplicer) streamSegment(
 	onBytes func([]byte) (bool, error),
 ) error {
 	scheme := "http"
-	if origReq.TLS != nil {
+	if origReq.TLS != nil || origReq.URL.Scheme == "https" {
 		scheme = "https"
 	}
-	urlStr := fmt.Sprintf("%s://%s%s",
-		scheme, net.JoinHostPort(targetIP, port), origReq.URL.RequestURI())
+	hostHeader := origReq.Host
+	if hostHeader == "" {
+		hostHeader = origReq.URL.Host
+	}
+	urlHost := hostHeader
+	if _, _, err := net.SplitHostPort(urlHost); err != nil {
+		if (scheme == "https" && port != "443") || (scheme == "http" && port != "80") {
+			urlHost = net.JoinHostPort(urlHost, port)
+		}
+	}
+	urlStr := fmt.Sprintf("%s://%s%s", scheme, urlHost, origReq.URL.RequestURI())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	// Route the physical TCP connection to targetIP:port while keeping the
+	// hostname in the URL, so crypto/tls sends the right SNI and validates
+	// the X.509 certificate against the hostname (not a raw IP).
+	dialCtx := context.WithValue(ctx, targetAddrKey{}, net.JoinHostPort(targetIP, port))
+	req, err := http.NewRequestWithContext(dialCtx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return err
 	}
-	req.Host = origReq.Host
+	req.Host = hostHeader
 	for k, v := range origReq.Header {
 		req.Header[k] = v
 	}

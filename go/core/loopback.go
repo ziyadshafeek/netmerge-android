@@ -77,41 +77,23 @@ func (e *Engine) handleCompoundHTTPS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SNI-preserving HTTPS clients pinned to each physical radio. Dialling
-	// the resolved IP directly (with ServerName=host) keeps DNS private.
-	makeHTTPSClient := func(link multipath.LinkType, sniHost string) *http.Client {
-		dialer := multipath.NewBoundDialer(e.mpEngine.Binder, link, 8*time.Second)
-		return &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
-					return multipath.DialBoundContext(dctx, dialer, network, addr)
-				},
-				ForceAttemptHTTP2:     false, // HTTP/1.1: independent TCP sockets per worker
-				MaxIdleConnsPerHost:   6,
-				IdleConnTimeout:       30 * time.Second,
-				ResponseHeaderTimeout: 8 * time.Second,
-				TLSClientConfig: &tls.Config{
-					ServerName: sniHost,
-					MinVersion: tls.VersionTLS12,
-				},
-			},
-		}
-	}
-	splicer := &multipath.HalvingSplicer{
-		WiFiClient: makeHTTPSClient(multipath.LinkWiFi, host),
-		CellClient: makeHTTPSClient(multipath.LinkCellular, host),
+	// Use the shared splicer: its transports route the TCP dial to the
+	// per-link edge IP via context while the URL keeps the hostname, so
+	// crypto/tls verifies against the hostname with system roots.
+	splicer := e.mpEngine.Splicer
+	if splicer == nil {
+		splicer = multipath.NewHalvingSplicer(e.mpEngine.Binder)
 	}
 
 	// Probe byte 0 to discover total size and ETag via Content-Range.
 	probeCtx, cancelProbe := context.WithTimeout(ctx, 8*time.Second)
 	defer cancelProbe()
-	probeURL := fmt.Sprintf("%s://%s%s", parsedURL.Scheme, net.JoinHostPort(probeIP, port), parsedURL.RequestURI())
-	probeReq, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, nil)
+	probeCtx = context.WithValue(probeCtx, multipath.TargetAddrKey(), net.JoinHostPort(probeIP, port))
+	probeReq, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	probeReq.Host = host
 	for k, vv := range r.Header {
 		if !strings.EqualFold(k, "Host") {
 			probeReq.Header[k] = vv
@@ -141,8 +123,8 @@ func (e *Engine) handleCompoundHTTPS(w http.ResponseWriter, r *http.Request) {
 
 	// No Range support: fall back to direct streaming.
 	if probeResp.StatusCode != http.StatusPartialContent || totalSize <= 0 {
-		directReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
-		directReq.Host = host
+		directCtx := context.WithValue(ctx, multipath.TargetAddrKey(), net.JoinHostPort(probeIP, port))
+		directReq, _ := http.NewRequestWithContext(directCtx, http.MethodGet, targetURL, nil)
 		resp, derr := probeClient.Do(directReq)
 		if derr != nil {
 			http.Error(w, derr.Error(), http.StatusBadGateway)
