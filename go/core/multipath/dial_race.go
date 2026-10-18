@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -121,7 +122,45 @@ func TrackFlow(link LinkType) func() {
 // so the next parallel stream on the other radio connects in 0.00ms!
 type warmConn struct {
 	conn      net.Conn
-	expiresAt time.Time
+	createdAt time.Time
+}
+
+// maxWarmSocketAge bounds how long a pre-warmed socket may sit idle before it
+// must be re-verified or discarded.
+const maxWarmSocketAge = 15 * time.Second
+
+// isSocketAlive performs a non-blocking MSG_PEEK to detect sockets the edge
+// server already closed (FIN), so warmPool never hands out dead connections.
+func isSocketAlive(conn net.Conn) bool {
+	for {
+		mc, ok := conn.(*MorphingConn)
+		if !ok {
+			break
+		}
+		conn = mc.Conn
+	}
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return false
+	}
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return false
+	}
+	alive := true
+	if err := rawConn.Read(func(fd uintptr) bool {
+		var buf [1]byte
+		n, _, recvErr := syscall.Recvfrom(int(fd), buf[:], syscall.MSG_PEEK|syscall.MSG_DONTWAIT)
+		if n == 0 && recvErr == nil {
+			alive = false // remote peer sent FIN (EOF)
+		} else if recvErr != nil && recvErr != syscall.EAGAIN && recvErr != syscall.EWOULDBLOCK {
+			alive = false
+		}
+		return true
+	}); err != nil {
+		return false
+	}
+	return alive
 }
 
 var (
@@ -142,11 +181,16 @@ func popWarmConn(link LinkType, ip, port string) net.Conn {
 	for len(list) > 0 {
 		wc := list[len(list)-1]
 		list = list[:len(list)-1]
-		if now.Before(wc.expiresAt) {
-			warmPool[k] = list
-			return wc.conn
+		if now.Sub(wc.createdAt) > maxWarmSocketAge {
+			wc.conn.Close()
+			continue
 		}
-		wc.conn.Close()
+		if !isSocketAlive(wc.conn) {
+			wc.conn.Close()
+			continue
+		}
+		warmPool[k] = list
+		return wc.conn
 	}
 	delete(warmPool, k)
 	return nil
@@ -164,7 +208,7 @@ func PutWarmConn(link LinkType, ip, port string, c net.Conn) {
 		c.Close()
 		return
 	}
-	warmPool[k] = append(list, warmConn{conn: c, expiresAt: time.Now().Add(4 * time.Second)})
+	warmPool[k] = append(list, warmConn{conn: c, createdAt: time.Now()})
 	warmMu.Unlock()
 }
 
@@ -380,9 +424,11 @@ func DialSpeculativeDualLink(
 	}
 
 	n = 0
+	var wg sync.WaitGroup
 	if wifiAddr != "" {
 		n++
-		go dialOne(LinkWiFi, wifiAddr, cellAddr)
+		wg.Add(1)
+		go func() { defer wg.Done(); dialOne(LinkWiFi, wifiAddr, cellAddr) }()
 	}
 	if cellAddr != "" {
 		n++
@@ -391,13 +437,17 @@ func DialSpeculativeDualLink(
 		if cellFallback == "" {
 			cellFallback = wifiAddr
 		}
-		go dialOne(LinkCellular, cellAddr, cellFallback)
+		wg.Add(1)
+		go func() { defer wg.Done(); dialOne(LinkCellular, cellAddr, cellFallback) }()
 	}
 	if n == 0 {
 		closedCh := make(chan raceResult)
 		close(closedCh)
 		return nil, 0, closedCh, errNoAddr
 	}
+	// Every standbyCh is closed exactly once all racers finish, so consumers
+	// doing `for res := range standbyCh` never leak a blocked goroutine.
+	go func() { wg.Wait(); close(ch) }()
 
 	first := <-ch
 	if first.err == nil {

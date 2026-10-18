@@ -42,31 +42,13 @@ func TestWriteFragmentedClientHelloHerdConformant(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("read failed: %v", err)
 	}
-	// Verify exactly 2 TLS records were emitted, neither using suspicious 0x0302 (TLS 1.1),
-	// and that reassembled handshake bytes match the original ClientHello 100%.
-	var reassembled []byte
-	offset := 0
-	records := 0
-	for offset < len(received) {
-		if offset+5 > len(received) {
-			t.Fatalf("truncated record header at %d", offset)
-		}
-		if received[offset] != 0x16 {
-			t.Fatalf("unexpected record type 0x%02x", received[offset])
-		}
-		if received[offset+1] != 0x03 || (received[offset+2] != 0x01 && received[offset+2] != 0x03) {
-			t.Fatalf("suspicious record version 0x%02x%02x", received[offset+1], received[offset+2])
-		}
-		rLen := int(binary.BigEndian.Uint16(received[offset+3 : offset+5]))
-		reassembled = append(reassembled, received[offset+5:offset+5+rLen]...)
-		offset += 5 + rLen
-		records++
+	// The TLS record must stay whole and byte-identical (JA3/JA4 parseable);
+	// SNI evasion happens at TCP segment boundaries, not via record splits.
+	if !bytes.Equal(received, orig) {
+		t.Fatalf("wire bytes differ from original ClientHello")
 	}
-	if records != 2 {
-		t.Fatalf("expected 2 clean TLS records, got %d", records)
-	}
-	if !bytes.Equal(reassembled, orig[5:]) {
-		t.Fatalf("reassembled ClientHello handshake payload mismatch")
+	if len(received) < 6 || received[0] != 0x16 {
+		t.Fatalf("not a single TLS handshake record on the wire")
 	}
 }
 
@@ -115,7 +97,8 @@ func TestMorphingConnPreservesTLSAppDataStream(t *testing.T) {
 
 func TestWriteClientHelloOnMorphingConnSingleFragment(t *testing.T) {
 	// Regression test: WriteClientHello called on a MorphingConn (the real
-	// compound_engine.go path) must emit exactly 2 records, not re-fragment.
+	// compound_engine.go path) must emit the ClientHello byte-identical —
+	// MorphingConn must never re-slice or corrupt the handshake.
 	orig := BuildProbeClientHello("example.com")
 	c1, c2 := net.Pipe()
 	defer c1.Close()
@@ -136,16 +119,7 @@ func TestWriteClientHelloOnMorphingConnSingleFragment(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("read failed: %v", err)
 	}
-	records := 0
-	for offset := 0; offset < len(received); {
-		if offset+5 > len(received) {
-			t.Fatalf("truncated record header at %d", offset)
-		}
-		rLen := int(binary.BigEndian.Uint16(received[offset+3 : offset+5]))
-		offset += 5 + rLen
-		records++
-	}
-	if records != 2 {
-		t.Fatalf("double fragmentation: got %d TLS records, want exactly 2", records)
+	if !bytes.Equal(received, orig) {
+		t.Fatalf("wire bytes differ from original ClientHello (handshake corrupted)")
 	}
 }

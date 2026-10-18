@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -77,18 +78,54 @@ func SynthesizeCarrierNAT64(ip4 net.IP) string {
 }
 
 type DualEndpoint struct {
-	Domain     string
-	mu         sync.RWMutex
-	WiFiAddr   string
-	CellAddr   string
-	CellRawV4  string
-	WiFiPool   []string // All DNS-verified edge IPs resolved on Wi-Fi
-	CellPool   []string // All DNS-verified edge IPs resolved on Cellular
-	rotIdx     atomic.Uint32
-	Updated    time.Time
-	readyCh    chan struct{}
-	once       sync.Once
-	refreshing atomic.Bool
+	Domain      string
+	mu          sync.RWMutex
+	WiFiAddr    string
+	CellAddr    string
+	CellRawV4   string
+	WiFiPool    []string // All DNS-verified edge IPs resolved on Wi-Fi
+	CellPool    []string // All DNS-verified edge IPs resolved on Cellular
+	rotIdx      atomic.Uint32
+	Updated     time.Time
+	lastAttempt time.Time // last populateEndpoint attempt (bounds refresh storms)
+	readyCh     chan struct{}
+	once        sync.Once
+	refreshing  atomic.Bool
+}
+
+// IsReady reports whether populateEndpoint finished (non-blocking).
+func (ep *DualEndpoint) IsReady() bool {
+	if ep.readyCh == nil {
+		return true
+	}
+	select {
+	case <-ep.readyCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// HasIPv4 reports whether the endpoint holds any usable IPv4 address.
+func (ep *DualEndpoint) HasIPv4() bool {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+	addrs := make([]string, 0, len(ep.WiFiPool)+len(ep.CellPool)+3)
+	addrs = append(addrs, ep.WiFiPool...)
+	addrs = append(addrs, ep.CellPool...)
+	addrs = append(addrs, ep.WiFiAddr, ep.CellAddr, ep.CellRawV4)
+	for _, s := range addrs {
+		if ip := net.ParseIP(s); ip != nil && ip.To4() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (ep *DualEndpoint) lastAttemptSince() time.Duration {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+	return time.Since(ep.lastAttempt)
 }
 
 // NextAddrs rotates across all DNS-verified edge IPs so consecutive flows
@@ -152,6 +189,27 @@ type VIPResolver struct {
 	dohClients map[string]*http.Client
 	dohNext    atomic.Uint64
 	resolve    func(ctx context.Context, domain string) (string, string)
+	// AllowUpstreamIPv6 gates ALL upstream AAAA (qtype 28) queries and native
+	// IPv6 dialing. Default false: on Jio, bound IPv4 sockets transparently
+	// traverse Android 464XLAT (clatd) / verified Carrier NAT64, so upstream
+	// IPv6 would only leak the globally-unique /64 SIM prefix. Set true only
+	// when the deployment explicitly needs native IPv6 upstream.
+	AllowUpstreamIPv6 bool
+}
+
+// ErrNoIPv4Endpoint is returned when a domain has no upstream IPv4 A records:
+// dialing must fail closed rather than fall back to native IPv6 (which would
+// expose the carrier /64 subscriber prefix).
+var ErrNoIPv4Endpoint = errors.New("multipath: no upstream IPv4 endpoint")
+
+func filterIPv4Only(ips []net.IP) []net.IP {
+	out := ips[:0]
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 type dohProvider struct {
@@ -249,7 +307,7 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 		r.mu.RUnlock()
 		pick := ring.vips[ring.idx.Add(1)%uint32(vipsPerDomain)]
 		w, c := ring.ep.Addrs()
-		if (w == "" || c == "") || time.Since(ring.ep.Updated) > 60*time.Second {
+		if ((w == "" || c == "") || time.Since(ring.ep.Updated) > 60*time.Second) && ring.ep.lastAttemptSince() > 30*time.Second {
 			if ring.ep.refreshing.CompareAndSwap(false, true) {
 				go func(ep *DualEndpoint) {
 					defer ep.refreshing.Store(false)
@@ -332,10 +390,11 @@ func (r *VIPResolver) LookupVIP(ip net.IP) (*DualEndpoint, bool) {
 	return ep, ok
 }
 
-func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
+func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) error {
 	defer ep.markReady()
-	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
-	defer cancel()
+	ep.mu.Lock()
+	ep.lastAttempt = time.Now()
+	ep.mu.Unlock()
 	type res struct {
 		link  LinkType
 		addr  string
@@ -344,7 +403,11 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	}
 	ch := make(chan res, 2)
 	go func() {
-		ips := r.lookupOnLink(ctx, ep.Domain, LinkWiFi, false)
+		// Each link lookup gets its own bounded context: the secondary link's
+		// in-flight DNS query is NEVER canceled when the primary succeeds.
+		lctx, lcancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		defer lcancel()
+		ips, _ := r.lookupOnLink(lctx, ep.Domain, LinkWiFi)
 		r.fireDecoyDoHChaff(LinkWiFi)
 		addr := ""
 		var pool []string
@@ -366,7 +429,9 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		ch <- res{link: LinkWiFi, addr: addr, pool: pool}
 	}()
 	go func() {
-		ips := r.lookupOnLink(ctx, ep.Domain, LinkCellular, true)
+		lctx, lcancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		defer lcancel()
+		ips, _ := r.lookupOnLink(lctx, ep.Domain, LinkCellular)
 		r.fireDecoyDoHChaff(LinkCellular)
 		addr := ""
 		rawV4 := ""
@@ -412,7 +477,10 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 			cAddr, cRawV4, cPool = second.addr, second.rawV4, second.pool
 		}
 		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4, wPool, cPool)
-		return
+		if len(wPool) == 0 && len(cPool) == 0 {
+			return ErrNoIPv4Endpoint
+		}
+		return nil
 	case <-graceTimer.C:
 	}
 	if wAddr != "" || cAddr != "" {
@@ -426,6 +494,10 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		cAddr, cRawV4, cPool = second.addr, second.rawV4, second.pool
 	}
 	r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4, wPool, cPool)
+	if len(wPool) == 0 && len(cPool) == 0 {
+		return ErrNoIPv4Endpoint
+	}
+	return nil
 }
 
 func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string, wPool, cPool []string) {
@@ -463,10 +535,10 @@ func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string, 
 	wFinal, cFinal, dom := ep.WiFiAddr, ep.CellAddr, ep.Domain
 	ep.mu.Unlock()
 	if wFinal != "" {
-		r.verifyAndWarmAnycastCloak(LinkWiFi, dom, wFinal)
+		r.verifyAndWarmAnycastCloak(LinkWiFi, dom, wFinal, wPool)
 	}
 	if cFinal != "" {
-		r.verifyAndWarmAnycastCloak(LinkCellular, dom, cFinal)
+		r.verifyAndWarmAnycastCloak(LinkCellular, dom, cFinal, cPool)
 	}
 }
 
@@ -479,76 +551,71 @@ var decoyDomains = []string{
 	"www.ietf.org",
 }
 
+// Chaff rate limiting: token-bucket style cooldown per link so decoy queries
+// never amplify a DNS burst, plus hard skips while chaff is in flight or the
+// link is saturated.
+var (
+	chaffMu       sync.Mutex
+	chaffLast     [3]int64
+	chaffInFlight [3]atomic.Int64
+)
+
+const chaffCooldown = 15 * time.Second
+
 func (r *VIPResolver) fireDecoyDoHChaff(link LinkType) {
-	var rnd [1]byte
-	GlobalPrivacy.FillCryptoRandom(rnd[:])
-	if rnd[0]&1 == 0 {
+	now := time.Now().UnixNano()
+	chaffMu.Lock()
+	if now-chaffLast[link] < int64(chaffCooldown) {
+		chaffMu.Unlock()
 		return
 	}
+	if !chaffInFlight[link].CompareAndSwap(0, 1) {
+		chaffMu.Unlock()
+		return
+	}
+	chaffLast[link] = now
+	chaffMu.Unlock()
+	// Skip chaff entirely while the link is saturated (burst in flight).
+	if activeFlows[link].Load() > 16 {
+		chaffInFlight[link].Store(0)
+		return
+	}
+	var rnd [1]byte
+	GlobalPrivacy.FillCryptoRandom(rnd[:])
 	decoy := decoyDomains[int(rnd[0])%len(decoyDomains)]
 	go func() {
+		defer chaffInFlight[link].Store(0)
 		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 		defer cancel()
 		_ = r.queryDoHOnLink(ctx, decoy, 1, link)
 	}()
 }
 
-var sharedCloudflareFronts = []string{
-	"104.16.132.229",
-	"104.16.133.229",
-	"172.64.155.209",
-	"162.159.135.42",
-}
-
-func isCloudflareAnycast(ip net.IP) bool {
-	v4 := ip.To4()
-	if v4 == nil {
-		return false
-	}
-	if v4[0] == 104 && (v4[1] >= 16 && v4[1] <= 31) {
-		return true
-	}
-	if v4[0] == 172 && (v4[1] >= 64 && v4[1] <= 71) {
-		return true
-	}
-	if v4[0] == 162 && (v4[1] == 158 || v4[1] == 159) {
-		return true
-	}
-	return false
-}
-
-// verifyAndWarmAnycastCloak solves the v4 TLS Alert & ClientHello.random replay
-// leak: it first verifies a candidate Anycast cloak IP in the background using
-// a disposable RFC 8446 probe ClientHello with a fresh CSPRNG nonce. ONLY if
-// the cloak IP responds with a valid ServerHello (0x16) for `domain` does it
-// open a clean, 0-byte pre-warmed socket and store it in warmPool!
-func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonicalIP string) {
+// verifyAndWarmAnycastCloak pre-warms warmPool using ONLY the domain's own
+// DNS-verified secondary edge IPs (never hardcoded fronts or /24 siblings:
+// Cloudflare terminates TLS at any edge IP but rejects unauthorized
+// VIP-to-Host mappings inside HTTP with Error 1034 / 421 / 403).
+func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonicalIP string, pool []string) {
 	if !GlobalPrivacy.AnycastCloakEnabled() || domain == "" || net.ParseIP(domain) != nil {
 		return
 	}
-	parsed := net.ParseIP(canonicalIP)
-	if !isCloudflareAnycast(parsed) {
-		return
-	}
-	var rnd [2]byte
-	GlobalPrivacy.FillCryptoRandom(rnd[:])
-	var cloakIP string
-	if rnd[0]&1 == 0 {
-		cloakIP = sharedCloudflareFronts[int(rnd[1])%len(sharedCloudflareFronts)]
-	} else {
-		v4 := parsed.To4()
-		sib := byte(2 + (int(rnd[1]) % 250))
-		if sib == v4[3] {
-			sib++
+	// Pick a secondary DNS-verified edge IP (not the canonical one).
+	var secondary string
+	for _, ip := range pool {
+		if ip != "" && ip != canonicalIP {
+			secondary = ip
+			break
 		}
-		cloakIP = net.IPv4(v4[0], v4[1], v4[2], sib).String()
+	}
+	if secondary == "" {
+		return
 	}
 	go func() {
 		// Step 1: Silent verification probe with a disposable CSPRNG ClientHello
 		probeCtx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
 		defer cancel()
 		d := NewBoundDialer(r.binder, link, 400*time.Millisecond)
-		probeConn, err := d.DialContext(probeCtx, "tcp", net.JoinHostPort(cloakIP, "443"))
+		probeConn, err := d.DialContext(probeCtx, "tcp", net.JoinHostPort(secondary, "443"))
 		if err != nil || probeConn == nil {
 			return
 		}
@@ -559,15 +626,15 @@ func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonical
 		rn, rErr := probeConn.Read(hdr[:])
 		_ = probeConn.Close()
 		if wErr != nil || rErr != nil || rn < 3 || hdr[0] != 0x16 {
-			// Candidate cloak IP rejected the SNI (e.g. TLS Alert 0x15); discard it
+			// Candidate rejected the SNI (e.g. TLS Alert 0x15); discard it
 			// so the user's real connection NEVER hits an alert or replays its nonce!
 			return
 		}
-		// Step 2: Candidate cloak IP is verified to serve `domain`! Open a clean,
+		// Step 2: Secondary edge IP is verified to serve `domain`! Open a clean,
 		// 0-byte socket and place it into warmPool under canonicalIP.
 		warmCtx, wCancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer wCancel()
-		cleanConn, err := d.DialContext(warmCtx, "tcp", net.JoinHostPort(cloakIP, "443"))
+		cleanConn, err := d.DialContext(warmCtx, "tcp", net.JoinHostPort(secondary, "443"))
 		if err != nil || cleanConn == nil {
 			return
 		}
@@ -579,56 +646,20 @@ func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonical
 	}()
 }
 
-func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link LinkType, preferV6 bool) []net.IP {
-	qtypes := []uint16{1, 28}
-	if preferV6 {
-		qtypes = []uint16{28, 1}
-	}
-	type dnsOut struct {
-		ips      []net.IP
-		priority int
-	}
-	outCh := make(chan dnsOut, 2)
-	for idx, qt := range qtypes {
-		go func(qtype uint16, prio int) {
-			if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
-				outCh <- dnsOut{ips: ips, priority: prio}
-			} else {
-				outCh <- dnsOut{ips: nil, priority: prio}
-			}
-		}(qt, idx+1)
-	}
-	dohTimer := time.NewTimer(1100 * time.Millisecond)
-	defer dohTimer.Stop()
-	var fallback []net.IP
-	for i := 0; i < 2; i++ {
-		select {
-		case res := <-outCh:
-			if len(res.ips) > 0 {
-				if res.priority == 1 {
-					return res.ips
-				}
-				if len(fallback) == 0 {
-					fallback = res.ips
-				}
-			}
-		case <-dohTimer.C:
-			if len(fallback) > 0 {
-				return fallback
-			}
-			otherLink := LinkCellular
-			if link == LinkCellular {
-				otherLink = LinkWiFi
-			}
-			if ips := r.queryDoHOnLink(ctx, domain, qtypes[0], otherLink); len(ips) > 0 {
-				return ips
-			}
-			return nil
-		case <-ctx.Done():
-			return fallback
+func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link LinkType) ([]net.IP, error) {
+	// Query ONLY IPv4 A records (qtype = 1) by default to prevent /64 SIM prefix leaks.
+	// On Jio, bound IPv4 sockets traverse Android 464XLAT (clatd) automatically.
+	if ips := r.queryDoHOnLink(ctx, domain, 1, link); len(ips) > 0 {
+		if v4 := filterIPv4Only(ips); len(v4) > 0 {
+			return v4, nil
 		}
 	}
-	return fallback
+	if r.AllowUpstreamIPv6 {
+		if ips := r.queryDoHOnLink(ctx, domain, 28, link); len(ips) > 0 {
+			return ips, nil
+		}
+	}
+	return nil, ErrNoIPv4Endpoint
 }
 
 func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {
@@ -674,9 +705,13 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		resp, err := client.Do(req)
 		if err != nil {
 			cancel()
-			// CRITICAL: Immediately purge dead 5G HTTP/2 connections from the
-			// transport pool so the next DNS query dials a fresh 4G socket!
-			client.CloseIdleConnections()
+			// CRITICAL: Only evict the idle pool on genuine transport failures
+			// (incl. our own 500ms per-request cap on a dead 5G socket), NEVER
+			// when the parent lookup context is canceled — otherwise every
+			// successful lookup under a DNS burst collapses the DoH transports.
+			if ctx.Err() == nil {
+				client.CloseIdleConnections()
+			}
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -684,7 +719,9 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		resp.Body.Close()
 		cancel()
 		if err != nil || status != http.StatusOK {
-			client.CloseIdleConnections()
+			if ctx.Err() == nil {
+				client.CloseIdleConnections()
+			}
 			continue
 		}
 		if ips := parseDNSResponsePacket(body, txID); len(ips) > 0 {
@@ -733,7 +770,9 @@ func (r *VIPResolver) queryODoHOnLink(ctx context.Context, wireReq []byte, txID 
 
 	resp, err := client.Do(req)
 	if err != nil {
-		client.CloseIdleConnections()
+		if ctx.Err() == nil {
+			client.CloseIdleConnections()
+		}
 		return nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))

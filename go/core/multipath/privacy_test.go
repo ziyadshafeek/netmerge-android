@@ -21,6 +21,18 @@ func (c *captureConn) SetDeadline(t time.Time) error      { return nil }
 func (c *captureConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *captureConn) SetWriteDeadline(t time.Time) error { return nil }
 
+// chunkConn records each Write call's byte count so tests can verify TCP-level
+// chunking (SNI split across segments) without TLS record fragmentation.
+type chunkConn struct {
+	captureConn
+	chunks []int
+}
+
+func (c *chunkConn) Write(b []byte) (int, error) {
+	c.chunks = append(c.chunks, len(b))
+	return c.captureConn.Write(b)
+}
+
 // buildTestClientHello crafts a minimal but structurally valid TLS 1.2
 // ClientHello carrying an SNI extension for "example.com".
 func buildTestClientHello() []byte {
@@ -85,11 +97,8 @@ func TestShatteredClientHelloPreservesTranscript(t *testing.T) {
 	if sniStart == 0 || sniEnd <= sniStart {
 		t.Fatalf("findSNIBounds failed: %d-%d", sniStart, sniEnd)
 	}
-	if payload[sniStart] != 0x00 || payload[sniStart+1] != 0x00 {
-		t.Fatal("SNI extension header not at reported bounds")
-	}
 
-	cc := &captureConn{}
+	cc := &chunkConn{}
 	n, err := WriteClientHello(cc, hello)
 	if err != nil {
 		t.Fatalf("WriteClientHello: %v", err)
@@ -99,31 +108,32 @@ func TestShatteredClientHelloPreservesTranscript(t *testing.T) {
 	}
 	out := cc.buf.Bytes()
 
-	// Parse the output as TLS records; concatenating payloads must
-	// reproduce the original handshake payload EXACTLY (RFC 8446
-	// transcript-hash invariance).
-	var reassembled []byte
-	recCount := 0
-	for off := 0; off < len(out); {
-		if off+5 > len(out) {
-			t.Fatalf("truncated record header at %d", off)
-		}
-		if out[off] != 0x16 || out[off+1] != 0x03 {
-			t.Fatalf("record %d has bad header: %02x %02x", recCount, out[off], out[off+1])
-		}
-		rl := int(binary.BigEndian.Uint16(out[off+3 : off+5]))
-		if off+5+rl > len(out) {
-			t.Fatalf("record %d overruns output", recCount)
-		}
-		reassembled = append(reassembled, out[off+5:off+5+rl]...)
-		off += 5 + rl
-		recCount++
+	// New contract: the TLS record stays WHOLE (single 0x16 record, JA3/JA4
+	// parseable) but is split across multiple TCP writes so the SNI hostname
+	// is never contiguous in one IP packet.
+	if !bytes.Equal(out, hello) {
+		t.Fatalf("output differs from input: got %d bytes, want %d", len(out), len(hello))
 	}
-	if recCount < 2 {
-		t.Fatalf("expected shattering into 2+ records, got %d", recCount)
+	if len(cc.chunks) < 2 {
+		t.Fatalf("expected TCP-level chunking, got %d write(s)", len(cc.chunks))
 	}
-	if !bytes.Equal(reassembled, payload) {
-		t.Fatalf("reassembled payload differs: got %d bytes, want %d", len(reassembled), len(payload))
+	// Verify a chunk boundary falls strictly inside the SNI hostname.
+	hostOff := bytes.Index(payload, []byte("example.com"))
+	if hostOff < 0 {
+		t.Fatal("SNI hostname not found in payload")
+	}
+	hostStart, hostEnd := 5+hostOff, 5+hostOff+len("example.com")
+	boundary := 0
+	splitInside := false
+	for _, cl := range cc.chunks {
+		boundary += cl
+		if boundary > hostStart && boundary < hostEnd {
+			splitInside = true
+			break
+		}
+	}
+	if !splitInside {
+		t.Fatalf("no chunk boundary inside SNI hostname (chunks=%v)", cc.chunks)
 	}
 }
 

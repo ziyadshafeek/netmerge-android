@@ -22,12 +22,9 @@ const (
 
 	// Linux/Android TCP socket options for low-latency congestion window ramp-up.
 	tcpQuickAck   = 0xc  // TCP_QUICKACK
-	tcpMaxSeg     = 0x2  // TCP_MAXSEG
 	tcpWindowClmp = 0xa  // TCP_WINDOW_CLAMP
 	ipTosDSCP     = 0x28 // Assured Forwarding AF11 / Low-Latency Throughput
 	ipv6TClass    = 0x43 // IPV6_TCLASS
-	cellSafeMSS   = 1220 // Safe MSS for Jio 4G/5G 464XLAT (IPv6 1280 MTU - 40B IPv6 - 20B TCP)
-	wifiSafeMSS   = 1440 // Safe MSS for PPPoE/Fiber Wi-Fi uplinks
 	spliceBufSize = 256 * 1024
 )
 
@@ -77,19 +74,16 @@ func NewBoundDialer(binder SocketBinder, link LinkType, timeout time.Duration) *
 						break
 					}
 				}
-				// Stock Android kernel herd conformity: default Best-Effort TOS (0x00)
-				// and canonical interface MSS (1360 Cellular / 1440 Wi-Fi) so JA4T
-				// never flags non-standard DSCP or weird MSS deltas.
+				// Stock Android kernel herd conformity: default Best-Effort TOS (0x00).
+				// NEVER touch TCP_MAXSEG here: the kernel must advertise the
+				// genuine hardware interface MSS for wlan0 / rmnet_data*, or
+				// BrowserLeaks-style TCP/IP fingerprinting flags MTU:1240 /
+				// Link Type:GIF (VPN tunnel detection via JA4T MSS delta).
 				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IP, syscall.IP_TOS, 0x00)
 				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IPV6, ipv6TClass, 0x00)
 				if network == "tcp" || network == "tcp4" || network == "tcp6" {
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpQuickAck, 1)
-					if link == LinkCellular {
-						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, cellSafeMSS)
-					} else {
-						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, wifiSafeMSS)
-					}
 				}
 			}); err != nil {
 				return err

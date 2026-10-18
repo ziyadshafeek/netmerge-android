@@ -456,8 +456,8 @@ func WriteClientHello(conn net.Conn, b []byte) (int, error) {
 	return conn.Write(b)
 }
 
-// SyscallConn delegates to the inner connection so setSocketMaxSeg's
-// TCP_MAXSEG clamp works through the MorphingConn wrapper.
+// SyscallConn forwards raw fd access to the underlying *net.TCPConn so
+// ReArmQuickAck and socket liveness checks never fail on a wrapped connection.
 func (mc *MorphingConn) SyscallConn() (syscall.RawConn, error) {
 	if sc, ok := mc.Conn.(syscall.Conn); ok {
 		return sc.SyscallConn()
@@ -465,87 +465,34 @@ func (mc *MorphingConn) SyscallConn() (syscall.RawConn, error) {
 	return nil, errors.New("morphing: inner conn has no syscall conn")
 }
 
-// setSocketMaxSeg dynamically clamps TCP_MAXSEG during ClientHello slicing
-// so the Linux kernel flushes the two TLS records into separate TCP segments
-// immediately, then restores standard MSS.
-func setSocketMaxSeg(conn net.Conn, mss int) {
-	sc, ok := conn.(syscall.Conn)
-	if !ok {
-		return
-	}
-	raw, err := sc.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = raw.Control(func(fd uintptr) {
-		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpMaxSeg, mss)
-		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-	})
-}
-
-// writeFragmentedClientHello implements Zero-Suspicion Herd-Conformant SNI Slicing:
-// 1. Splits the TLS ClientHello into 2 clean TLS records right across the SNI
-// hostname midpoint (with a +/- 2 byte cryptographic jitter).
-// 2. Preserves the client's authentic legacy_record_version (or uniform 0x0303
-// on the continuation record) so enterprise WAFs (Cloudflare/Akamai/Suricata)
-// never see anomalous TLS 1.1 (0x0302) record version oscillation.
-// 3. Uses kernel TCP_MAXSEG clamping to force separate wire packets without
-// artificial sleep delays while preserving 100% RFC 8446 Transcript-Hash invariance.
+// writeFragmentedClientHello splits the TLS ClientHello across separate TCP
+// segments WITHOUT mutating TCP_MAXSEG: with TCP_NODELAY each Write lands in
+// its own segment, so the SNI is never contiguous in one IP packet, while the
+// TLS record itself stays whole and parseable (JA3/JA4 fingerprints intact).
 func writeFragmentedClientHello(conn net.Conn, b []byte) (int, error) {
-	if len(b) < 43 || b[0] != 0x16 || b[1] != 0x03 || b[5] != 0x01 {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
+	if len(b) <= 5 || b[0] != 0x16 {
 		return conn.Write(b)
 	}
-	recordLen := int(binary.BigEndian.Uint16(b[3:5]))
-	if len(b) < 5+recordLen || recordLen < 32 {
-		return conn.Write(b)
+	split1 := 2
+	split2 := len(b) / 2
+	if sniMid := findSNIMidpoint(b[5:]); sniMid > 16 && 5+sniMid < len(b) {
+		split2 = 5 + sniMid
 	}
-	payload := b[5 : 5+recordLen]
-	var rnd [2]byte
-	GlobalPrivacy.FillCryptoRandom(rnd[:])
-	sniMid := findSNIMidpoint(payload)
-	var cut int
-	if sniMid > 16 && sniMid < len(payload)-8 {
-		jitter := int(rnd[0]%5) - 2 // -2..+2 bytes around SNI midpoint
-		cut = sniMid + jitter
-	} else {
-		cut = len(payload)/2 + int(rnd[0]%7)
+	written := 0
+	for _, chunk := range [][]byte{b[:split1], b[split1:split2], b[split2:]} {
+		if len(chunk) == 0 {
+			continue
+		}
+		n, err := conn.Write(chunk)
+		written += n
+		if err != nil {
+			return written, err
+		}
 	}
-	if cut < 8 {
-		cut = 8
-	}
-	if cut >= len(payload)-4 {
-		cut = len(payload) / 2
-	}
-	part1 := payload[:cut]
-	part2 := payload[cut:]
-	// Record 1: keeps the original record version (0x0301 or 0x0303) sent by BoringSSL.
-	rec1 := make([]byte, 5+len(part1))
-	rec1[0] = 0x16
-	rec1[1] = b[1]
-	rec1[2] = b[2]
-	binary.BigEndian.PutUint16(rec1[3:5], uint16(len(part1)))
-	copy(rec1[5:], part1)
-	// Record 2: uses standard TLS 1.2/1.3 record framing (0x0303) for continuation.
-	tailLen := len(b) - (5 + recordLen)
-	rec2 := make([]byte, 5+len(part2)+tailLen)
-	rec2[0] = 0x16
-	rec2[1] = 0x03
-	rec2[2] = 0x03
-	binary.BigEndian.PutUint16(rec2[3:5], uint16(len(part2)))
-	copy(rec2[5:], part2)
-	if tailLen > 0 {
-		copy(rec2[5+len(part2):], b[5+recordLen:])
-	}
-	setSocketMaxSeg(conn, 128)
-	if _, err := conn.Write(rec1); err != nil {
-		setSocketMaxSeg(conn, wifiSafeMSS)
-		return 0, err
-	}
-	setSocketMaxSeg(conn, wifiSafeMSS)
-	if _, err := conn.Write(rec2); err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return written, nil
 }
 
 // BuildProbeClientHello constructs a RFC 8446-compliant TLS 1.3 ClientHello
