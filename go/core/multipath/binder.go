@@ -31,6 +31,11 @@ const (
 	spliceBufSize = 256 * 1024
 )
 
+// L4 morphing state: per-socket DSCP rotation + window/MSS jitter so every
+// connection presents a distinct L3/L4 signature (JA4T / p0f evasion).
+var l4MorphSalt atomic.Uint64
+var dscpPool = [4]int{0x28, 0x48, 0x20, 0x00}
+
 // SocketBinder binds raw socket descriptors to physical Android Networks (Wi-Fi / Cellular)
 // and reports real-time per-link byte telemetry.
 type SocketBinder interface {
@@ -80,17 +85,22 @@ func NewBoundDialer(binder SocketBinder, link LinkType, timeout time.Duration) *
 						break
 					}
 				}
-				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IP, syscall.IP_TOS, ipTosDSCP)
-				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IPV6, ipv6TClass, ipTosDSCP)
-
+				salt := l4MorphSalt.Add(1)
+				dscp := dscpPool[salt&3]
+				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IP, syscall.IP_TOS, dscp)
+				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IPV6, ipv6TClass, dscp)
 				if network == "tcp" || network == "tcp4" || network == "tcp6" {
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpQuickAck, 1)
-					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpWindowClmp, socketBufSize)
+					// Morph TCP_WINDOW_CLAMP and TCP_MAXSEG per flow to defeat JA4T / p0f
+					// cross-IP connection linking at the destination website.
+					winJitter := int((salt * 4096) & 0xFFFF)
+					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpWindowClmp, socketBufSize-winJitter)
+					mssJitter := int((salt * 4) & 0x1C) // 0..28 byte MSS morph
 					if link == LinkCellular {
-						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, cellSafeMSS)
+						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, cellSafeMSS-mssJitter)
 					} else {
-						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, wifiSafeMSS)
+						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, wifiSafeMSS-mssJitter)
 					}
 				}
 			}); err != nil {

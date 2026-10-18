@@ -553,6 +553,14 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 			// Note: QUIC (UDP/443) is blocked upfront in handleUDP with ICMP
 			// Port Unreachable, so no QUICGuard eviction is needed here.
 
+			// Live STUN payload firewall: block WebRTC STUN Magic Cookie
+			// (0x2112A442) on any UDP port using the actual packet bytes.
+			// (handleUDP only sees a nil payload, so the DPI check there
+			// can never fire — this is where the bytes live.)
+			if multipath.ShouldBlockPrivacyLeak(true, (*buf)[:n], us.dstPort) {
+				continue // drop the packet; keep the session alive
+			}
+
 			if _, err := us.upstream.Write((*buf)[:n]); err != nil {
 				return
 			}

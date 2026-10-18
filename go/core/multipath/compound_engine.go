@@ -205,11 +205,13 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 			rStart := time.Now()
 			rn, rErr := activeUpstream.Read(firstResp)
 			_ = activeUpstream.SetReadDeadline(time.Time{})
-			if rn > 0 {
+			if rn > 0 && !isInvalidTLSResponse(firstPayload[:n], firstResp[:rn]) {
+				// Primary succeeded with a valid ServerHello!
 				recycleStandby()
 				RecordLinkBytes(activeLink, int64(rn))
 				if e.MPSched != nil {
 					e.MPSched.RecordRTT(activeLink, time.Since(rStart))
+					e.MPSched.RecordSuccess(activeLink)
 					e.MPSched.RecordBytes(activeLink, int64(rn), time.Since(rStart))
 				}
 				if e.Binder != nil {
@@ -219,7 +221,9 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 					activeUpstream.Close()
 					return err
 				}
-			} else if rErr != nil {
+			} else if rErr != nil || isInvalidTLSResponse(firstPayload[:n], firstResp[:rn]) {
+				// Primary failed, timed out, OR an Anycast sibling returned a TLS Alert (0x15):
+				// invisibly replay the full buffered ClientHello onto standby or canonical IP!
 				MarkLinkStalled(activeLink, 3*time.Second)
 				if e.MPSched != nil {
 					e.MPSched.RecordFailure(activeLink)
@@ -239,9 +243,31 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 					if e.Binder != nil {
 						e.Binder.OnBytes(int(activeLink), 0, int64(n))
 					}
-				} else if !isTimeoutErr(rErr) {
-					activeUpstream.Close()
-					return rErr
+				} else {
+					// Single-radio fallback: dial canonical DNS IP directly without warmPool
+					wCanon, cCanon := ep.Addrs()
+					canonIP := wCanon
+					if activeLink == LinkCellular && cCanon != "" {
+						canonIP = cCanon
+					}
+					d := NewBoundDialer(e.Binder, activeLink, 4*time.Second)
+					if directConn, dErr := d.DialContext(ctx, "tcp", net.JoinHostPort(canonIP, port)); dErr == nil {
+						activeUpstream.Close()
+						activeUpstream = directConn
+						if _, err := WriteClientHello(activeUpstream, firstPayload[:n]); err != nil {
+							activeUpstream.Close()
+							return err
+						}
+					} else if rErr != nil && !isTimeoutErr(rErr) {
+						activeUpstream.Close()
+						return rErr
+					} else if rn > 0 {
+						// Last resort: write original response if canonical dial also failed
+						if _, err := clientConn.Write(firstResp[:rn]); err != nil {
+							activeUpstream.Close()
+							return err
+						}
+					}
 				}
 			}
 		}
@@ -616,6 +642,23 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 		}
 	}
 	return nil
+}
+
+// isInvalidTLSResponse detects when an Anycast sibling/front IP rejects a TLS
+// ClientHello with a TLS Alert record (0x15) or plain HTTP error instead of a
+// valid ServerHello (0x16) or ChangeCipherSpec (0x14).
+func isInvalidTLSResponse(sentPayload, recvPayload []byte) bool {
+	if len(sentPayload) >= 6 && sentPayload[0] == 0x16 && sentPayload[5] == 0x01 {
+		if len(recvPayload) == 0 {
+			return true
+		}
+		// Valid TLS server reply must start with Handshake (0x16) or CCS (0x14).
+		// If it starts with Alert (0x15) or 'H' (HTTP/1.1 400), reject and replay!
+		if recvPayload[0] != 0x16 && recvPayload[0] != 0x14 {
+			return true
+		}
+	}
+	return false
 }
 
 func isTimeoutErr(err error) bool {

@@ -50,10 +50,31 @@ type DualEndpoint struct {
 	WiFiAddr   string
 	CellAddr   string
 	CellRawV4  string
+	WiFiPool   []string // All DNS-verified edge IPs resolved on Wi-Fi
+	CellPool   []string // All DNS-verified edge IPs resolved on Cellular
+	rotIdx     atomic.Uint32
 	Updated    time.Time
 	readyCh    chan struct{}
 	once       sync.Once
 	refreshing atomic.Bool
+}
+
+// NextAddrs rotates across all DNS-verified edge IPs so consecutive flows
+// spread over the CDN's full edge set instead of pinning the first IP.
+// Falls back to WiFiAddr/CellAddr when pools are empty.
+func (ep *DualEndpoint) NextAddrs() (string, string) {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
+	idx := int(ep.rotIdx.Add(1))
+	w := ep.WiFiAddr
+	if len(ep.WiFiPool) > 0 {
+		w = ep.WiFiPool[idx%len(ep.WiFiPool)]
+	}
+	c := ep.CellAddr
+	if len(ep.CellPool) > 0 {
+		c = ep.CellPool[idx%len(ep.CellPool)]
+	}
+	return w, c
 }
 
 func (ep *DualEndpoint) markReady() {
@@ -293,6 +314,7 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		link  LinkType
 		addr  string
 		rawV4 string
+		pool  []string
 	}
 	ch := make(chan res, 2)
 
@@ -302,44 +324,64 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	// the working radio's IP.
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkWiFi, false)
+		r.fireDecoyDoHChaff(LinkWiFi)
 		addr := ""
+		var pool []string
 		for _, ip := range ips {
 			if v4 := ip.To4(); v4 != nil {
-				addr = v4.String()
-				break
+				s := v4.String()
+				if addr == "" {
+					addr = s
+				}
+				pool = append(pool, s)
 			}
 		}
 		if addr == "" && len(ips) > 0 {
 			addr = ips[0].String()
+			for _, ip := range ips {
+				pool = append(pool, ip.String())
+			}
 		}
-		ch <- res{link: LinkWiFi, addr: addr}
+		ch <- res{link: LinkWiFi, addr: addr, pool: pool}
 	}()
 
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkCellular, true)
+		r.fireDecoyDoHChaff(LinkCellular)
 		addr := ""
 		rawV4 := ""
+		var pool []string
 		for _, ip := range ips {
-			if v4 := ip.To4(); v4 != nil && rawV4 == "" {
-				rawV4 = v4.String()
-			}
-			if ip.To4() == nil && ip.To16() != nil && addr == "" {
-				addr = ip.String()
+			if v4 := ip.To4(); v4 != nil {
+				if rawV4 == "" {
+					rawV4 = v4.String()
+				}
+			} else if ip.To16() != nil {
+				s := ip.String()
+				if addr == "" {
+					addr = s
+				}
+				pool = append(pool, s)
 			}
 		}
 		if addr == "" && rawV4 != "" {
 			addr = rawV4
+			for _, ip := range ips {
+				if v4 := ip.To4(); v4 != nil {
+					pool = append(pool, v4.String())
+				}
+			}
 		}
-		ch <- res{link: LinkCellular, addr: addr, rawV4: rawV4}
+		ch <- res{link: LinkCellular, addr: addr, rawV4: rawV4, pool: pool}
 	}()
 
 	var wAddr, cAddr, cRawV4 string
+	var wPool, cPool []string
 	first := <-ch
 	if first.link == LinkWiFi {
-		wAddr = first.addr
+		wAddr, wPool = first.addr, first.pool
 	} else {
-		cAddr = first.addr
-		cRawV4 = first.rawV4
+		cAddr, cRawV4, cPool = first.addr, first.rawV4, first.pool
 	}
 
 	graceTimer := time.NewTimer(50 * time.Millisecond)
@@ -347,39 +389,42 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	case second := <-ch:
 		graceTimer.Stop()
 		if second.link == LinkWiFi {
-			wAddr = second.addr
+			wAddr, wPool = second.addr, second.pool
 		} else {
-			cAddr = second.addr
-			cRawV4 = second.rawV4
+			cAddr, cRawV4, cPool = second.addr, second.rawV4, second.pool
 		}
-		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4)
+		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4, wPool, cPool)
 		return
 	case <-graceTimer.C:
 	}
 
 	if wAddr != "" || cAddr != "" {
-		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4)
+		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4, wPool, cPool)
 		ep.markReady()
 	}
 
 	second := <-ch
 	if second.link == LinkWiFi {
-		wAddr = second.addr
+		wAddr, wPool = second.addr, second.pool
 	} else {
-		cAddr = second.addr
-		cRawV4 = second.rawV4
+		cAddr, cRawV4, cPool = second.addr, second.rawV4, second.pool
 	}
-	r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4)
+	r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4, wPool, cPool)
 }
 
-func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string) {
+func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string, wPool, cPool []string) {
 	ep.mu.Lock()
-	defer ep.mu.Unlock()
 	if w != "" {
 		ep.WiFiAddr = w
 	}
 	if c != "" {
 		ep.CellAddr = c
+	}
+	if len(wPool) > 0 {
+		ep.WiFiPool = wPool
+	}
+	if len(cPool) > 0 {
+		ep.CellPool = cPool
 	}
 	if cRawV4 != "" {
 		ep.CellRawV4 = cRawV4
@@ -399,6 +444,112 @@ func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string) 
 	if ep.WiFiAddr != "" || ep.CellAddr != "" {
 		ep.Updated = time.Now()
 	}
+	wFinal, cFinal := ep.WiFiAddr, ep.CellAddr
+	ep.mu.Unlock()
+
+	// Background-verify Anycast siblings for both radios (never blocks the
+	// user path; only verified sockets enter warmPool).
+	if wFinal != "" {
+		r.maybeWarmAnycastSibling(LinkWiFi, wFinal)
+	}
+	if cFinal != "" {
+		r.maybeWarmAnycastSibling(LinkCellular, cFinal)
+	}
+}
+
+var decoyDomains = []string{
+	"www.wikipedia.org",
+	"www.mozilla.org",
+	"www.apache.org",
+	"www.kernel.org",
+	"www.debian.org",
+	"www.ietf.org",
+}
+
+// fireDecoyDoHChaff sends an asynchronous, zero-latency decoy DoH query over an
+// already-open HTTP/2 DoH connection on an alternate authority, blinding ISP
+// timing/volume correlation without adding a single millisecond to user traffic.
+func (r *VIPResolver) fireDecoyDoHChaff(link LinkType) {
+	var rnd [1]byte
+	_, _ = rand.Read(rnd[:])
+	// Fire on ~50% of lookups so chaff volume itself is non-deterministic.
+	if rnd[0]&1 == 0 {
+		return
+	}
+	decoy := decoyDomains[int(rnd[0])%len(decoyDomains)]
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		defer cancel()
+		_ = r.queryDoHOnLink(ctx, decoy, 1, link)
+	}()
+}
+
+// Shared Anycast front IPs (Cloudflare / Fastly global anycast ingress) that
+// hide the specific customer IP range from the ISP while terminating on the
+// exact same local Indian PoP hardware.
+var sharedCloudflareFronts = []string{
+	"104.16.132.229",
+	"104.16.133.229",
+	"172.64.155.209",
+	"162.159.135.42",
+}
+
+func isCloudflareAnycast(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if v4[0] == 104 && (v4[1] >= 16 && v4[1] <= 31) {
+		return true
+	}
+	if v4[0] == 172 && (v4[1] >= 64 && v4[1] <= 71) {
+		return true
+	}
+	if v4[0] == 162 && (v4[1] == 158 || v4[1] == 159) {
+		return true
+	}
+	return false
+}
+
+// maybeWarmAnycastSibling pre-connects a cloaked Anycast front/sibling IP in
+// the background and stores it in warmPool under canonicalIP. Because
+// ForwardWithMidHandshakeReplay checks isInvalidTLSResponse() and replays the
+// buffered ClientHello onto canonicalIP if the server returns a TLS Alert (0x15),
+// this hides the destination IP from the ISP with ZERO risk of breaking sites!
+func (r *VIPResolver) maybeWarmAnycastSibling(link LinkType, canonicalIP string) {
+	parsed := net.ParseIP(canonicalIP)
+	if !isCloudflareAnycast(parsed) {
+		return
+	}
+	var rnd [2]byte
+	_, _ = rand.Read(rnd[:])
+	// Alternate between a shared high-traffic Cloudflare Front IP (completely
+	// hiding the target's /24 subnet from the ISP) and a /24 sibling IP.
+	var cloakIP string
+	if rnd[0]&1 == 0 {
+		cloakIP = sharedCloudflareFronts[int(rnd[1])%len(sharedCloudflareFronts)]
+	} else {
+		v4 := parsed.To4()
+		sib := byte(2 + (int(rnd[1]) % 250))
+		if sib == v4[3] {
+			sib++
+		}
+		cloakIP = net.IPv4(v4[0], v4[1], v4[2], sib).String()
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+		defer cancel()
+		d := NewBoundDialer(r.binder, link, 350*time.Millisecond)
+		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(cloakIP, "443"))
+		if err != nil || conn == nil {
+			return
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+		armKeepAlive(conn)
+		PutWarmConn(link, canonicalIP, "443", conn)
+	}()
 }
 
 func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link LinkType, preferV6 bool) []net.IP {

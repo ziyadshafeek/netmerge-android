@@ -153,3 +153,27 @@ func TestDoHClientsKeyedPerLink(t *testing.T) {
 		t.Fatal("cellular DoH client overwrote the Wi-Fi client for 1.1.1.1")
 	}
 }
+
+func TestIsInvalidTLSResponse(t *testing.T) {
+	hello := buildTestClientHello()
+	// Valid ServerHello (0x16) -> not invalid.
+	if isInvalidTLSResponse(hello, []byte{0x16, 0x03, 0x03, 0x00, 0x10}) {
+		t.Fatal("valid ServerHello flagged invalid")
+	}
+	// TLS Alert (0x15) -> invalid, must replay.
+	if !isInvalidTLSResponse(hello, []byte{0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}) {
+		t.Fatal("TLS Alert not flagged invalid")
+	}
+	// Plain HTTP error -> invalid, must replay.
+	if !isInvalidTLSResponse(hello, []byte("HTTP/1.1 400 Bad Request\r\n")) {
+		t.Fatal("HTTP error not flagged invalid")
+	}
+	// Empty read -> invalid.
+	if !isInvalidTLSResponse(hello, nil) {
+		t.Fatal("empty response not flagged invalid")
+	}
+	// Non-TLS payload -> never invalid (guard only applies to handshakes).
+	if isInvalidTLSResponse([]byte("GET / HTTP/1.1"), []byte{0x15}) {
+		t.Fatal("non-TLS payload flagged invalid")
+	}
+}

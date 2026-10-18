@@ -48,22 +48,19 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 
 	qtype := binary.BigEndian.Uint16(query[pos : pos+2])
 
-	// Suppress AAAA (28), SVCB (64), and HTTPS (65) with instant NODATA
-	// so Chrome/YouTube always use the compounded IPv4 VIPs.
-	if qtype == 28 || qtype == 64 || qtype == 65 {
+	// Return instant NODATA (NOERROR, ANCOUNT=0) for ALL non-A record types
+	// (AAAA=28, SVCB=64, HTTPS=65, TXT=16, SRV=33, PTR=12, MX=15, etc.) so
+	// upstream-free DNS interception never drops packets or stalls apps.
+	if qtype != 1 {
 		resp := make([]byte, 0, pos+4)
 		resp = append(resp, query[0:2]...)
-		resp = append(resp, 0x81, 0x80)
-		resp = append(resp, 0x00, 0x01)
-		resp = append(resp, 0x00, 0x00)
+		resp = append(resp, 0x81, 0x80) // QR=1, RD=1, RA=1, RCODE=0 (NOERROR)
+		resp = append(resp, 0x00, 0x01) // QDCOUNT=1
+		resp = append(resp, 0x00, 0x00) // ANCOUNT=0
 		resp = append(resp, 0x00, 0x00)
 		resp = append(resp, 0x00, 0x00)
 		resp = append(resp, query[12:pos+4]...)
 		return resp
-	}
-
-	if qtype != 1 {
-		return nil
 	}
 
 	hostname := strings.Join(labels, ".")
@@ -75,7 +72,14 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 	defer cancel()
 	vip, _ := d.resolver.GetOrAllocate(ctx, hostname)
 	if vip == nil {
-		return nil
+		// Return instant SERVFAIL (RCODE=2) instead of nil so apps fail fast
+		// rather than hanging for 5-15s waiting for a dropped UDP packet.
+		resp := make([]byte, 0, pos+4)
+		resp = append(resp, query[0:2]...)
+		resp = append(resp, 0x81, 0x82) // RCODE=2 (SERVFAIL)
+		resp = append(resp, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+		resp = append(resp, query[12:pos+4]...)
+		return resp
 	}
 
 	resp := make([]byte, 0, pos+20)
@@ -87,7 +91,7 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 	resp = append(resp, 0x00, 0x00)
 	resp = append(resp, query[12:pos+4]...)
 
-	// Answer with TTL = 2 seconds so parallel fetches rotate across the VIP ring
+	// Answer with TTL = 2 seconds so parallel fetches rotate across the VIP ring.
 	resp = append(resp, 0xC0, 0x0C)
 	resp = append(resp, 0x00, 0x01)
 	resp = append(resp, 0x00, 0x01)

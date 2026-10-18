@@ -178,20 +178,47 @@ type raceResult struct {
 
 // DialLinkConn dials a single link (with automatic NAT64 synthesis on Cellular)
 // and sets TCP_NODELAY.
+var cellDualExitToggle atomic.Uint64
+
+// DialLinkConn dials a single link and stripes Cellular IPv4 connections across
+// BOTH the Carrier's Hardware NAT64 Border Exit (SynthesizeCarrierNAT64) and
+// native CGNAT IPv4, with instant fallback if either path is unsupported.
 func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, fallbackIPv4, port string) (net.Conn, error) {
+	if port == "443" {
+		FireGhostTTLClientHello(binder, link, net.JoinHostPort(ip, port))
+	}
 	if c := popWarmConn(link, ip, port); c != nil {
 		return c, nil
 	}
 	d := NewBoundDialer(binder, link, 4*time.Second)
+	// ISP-Level Dual-Exit Striping on Cellular: alternate between the Carrier's
+	// Hardware NAT64 Border Gateway (64:ff9b::/96 -> distinct public exit IPv4 pool)
+	// and local CGNAT IPv4, with instant fallback so it never fails on IPv4-only SIMs.
+	if link == LinkCellular {
+		parsed := net.ParseIP(ip)
+		if parsed != nil && parsed.To4() != nil && cellDualExitToggle.Add(1)%2 == 0 {
+			if nat64 := SynthesizeCarrierNAT64(parsed); nat64 != "" {
+				natCtx, cancel := context.WithTimeout(ctx, 1100*time.Millisecond)
+				c, err := d.DialContext(natCtx, "tcp", net.JoinHostPort(nat64, port))
+				cancel()
+				if err == nil && c != nil {
+					if tc, ok := c.(*net.TCPConn); ok {
+						_ = tc.SetNoDelay(true)
+					}
+					armKeepAlive(c)
+					return c, nil
+				}
+			}
+		}
+	}
 	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 	if err != nil && link == LinkCellular {
-		// Try RFC 6052 NAT64 synthesis for IPv6-only cellular (Jio)
 		targetIP4 := net.ParseIP(ip)
 		if targetIP4 == nil || targetIP4.To4() == nil {
 			targetIP4 = net.ParseIP(fallbackIPv4)
 		}
 		if targetIP4 != nil && targetIP4.To4() != nil {
-			nat64 := toNAT64(targetIP4)
+			nat64 := SynthesizeCarrierNAT64(targetIP4)
 			c, err = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
 		}
 	}
@@ -222,7 +249,10 @@ func DialSpeculativeDualLink(
 		preferred = StripedPreferredLink()
 	}
 
-	wifiAddr, cellAddr := ep.WaitReady(ctx)
+	// Wait for the endpoint to be ready, then rotate across all DNS-verified
+	// edge IPs so consecutive flows spread over the CDN's full edge set.
+	_, _ = ep.WaitReady(ctx)
+	wifiAddr, cellAddr := ep.NextAddrs()
 	// STRICT single-radio check: the resolver mirrors the working radio's IP
 	// into the dead radio's field (and the dial fallback routes it out the
 	// default network anyway), so a non-empty addr does NOT prove the radio is
