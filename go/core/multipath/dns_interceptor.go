@@ -82,7 +82,10 @@ func (d *DNSInterceptor) HandleQuery(query []byte) []byte {
 
 	// Known AAAA-only beacons: NODATA before any VIP is allocated, so no
 	// synthetic 198.18.x.x is ever handed out and no refresh storm starts.
-	if isKnownAAAAOnlyDomain(hostname) {
+	// The ipv6. prefix heuristic catches any provider's IPv6-only leak-test
+	// beacon, not just the curated list.
+	lower := strings.ToLower(hostname)
+	if isKnownAAAAOnlyDomain(hostname) || strings.HasPrefix(lower, "ipv6.") || strings.Contains(lower, ".ipv6.") {
 		return nodataResponse(query, pos)
 	}
 

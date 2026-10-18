@@ -273,9 +273,9 @@ func DialThroughPrivacyEgress(
 	network, targetAddr string,
 ) (net.Conn, error) {
 	if ep == nil || ep.Address == "" {
-		return dialer.DialContext(ctx, network, targetAddr)
+		return DialBoundContext(ctx, dialer, network, targetAddr)
 	}
-	rawConn, err := dialer.DialContext(ctx, "tcp", ep.Address)
+	rawConn, err := DialBoundContext(ctx, dialer, "tcp", ep.Address)
 	if err != nil {
 		return nil, err
 	}
@@ -470,29 +470,33 @@ func (mc *MorphingConn) SyscallConn() (syscall.RawConn, error) {
 // its own segment, so the SNI is never contiguous in one IP packet, while the
 // TLS record itself stays whole and parseable (JA3/JA4 fingerprints intact).
 func writeFragmentedClientHello(conn net.Conn, b []byte) (int, error) {
+	// The TLS record stays WHOLE (single 0x16 record, JA3/JA4 parseable).
+	// SNI evasion happens at TCP segment boundaries: with TCP_NODELAY each
+	// Write becomes its own segment, so the SNI hostname is never contiguous
+	// in one IP packet — while the 5-byte TLS record header always rides
+	// intact in the first segment (custom fingerprint parsers that don't
+	// reassemble split headers keep working).
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 	}
-	if len(b) <= 5 || b[0] != 0x16 {
+	if len(b) <= 64 || b[0] != 0x16 {
 		return conn.Write(b)
 	}
-	split1 := 2
-	split2 := len(b) / 2
-	if sniMid := findSNIMidpoint(b[5:]); sniMid > 16 && 5+sniMid < len(b) {
-		split2 = 5 + sniMid
+	// Split once, right inside the SNI hostname extension. The 5-byte TLS
+	// record header (b[:5]) is ALWAYS sent intact in the first segment.
+	splitPos := len(b) / 2
+	// The end guard only needs >=2 bytes in the tail segment; the SNI
+	// midpoint is inside the hostname by construction, so splitting there
+	// always achieves the goal even for small hellos.
+	if sniMid := findSNIMidpoint(b); sniMid >= 40 && sniMid < len(b)-2 {
+		splitPos = sniMid
 	}
-	written := 0
-	for _, chunk := range [][]byte{b[:split1], b[split1:split2], b[split2:]} {
-		if len(chunk) == 0 {
-			continue
-		}
-		n, err := conn.Write(chunk)
-		written += n
-		if err != nil {
-			return written, err
-		}
+	n1, err := conn.Write(b[:splitPos])
+	if err != nil {
+		return n1, err
 	}
-	return written, nil
+	n2, err := conn.Write(b[splitPos:])
+	return n1 + n2, err
 }
 
 // BuildProbeClientHello constructs a RFC 8446-compliant TLS 1.3 ClientHello
@@ -547,12 +551,53 @@ func BuildProbeClientHello(sni string) []byte {
 	return pkt
 }
 
-func findSNIMidpoint(handshake []byte) int {
-	s, e := findSNIBounds(handshake)
-	if e <= s {
+// findSNIMidpoint locates the middle byte of the SNI server_name extension
+// in a TLS ClientHello record, as an ABSOLUTE offset into b (which includes
+// the 5-byte TLS record header).
+func findSNIMidpoint(b []byte) int {
+	// TLS Record header (5 bytes) + Handshake header (4 bytes) + Version (2) + Random (32) = 43 bytes
+	if len(b) < 50 || b[0] != 0x16 || b[5] != 0x01 {
 		return 0
 	}
-	return (s + e) / 2
+	pos := 43
+	// Skip Session ID
+	if pos >= len(b) {
+		return 0
+	}
+	pos += 1 + int(b[pos])
+	// Skip Cipher Suites
+	if pos+2 > len(b) {
+		return 0
+	}
+	pos += 2 + (int(b[pos])<<8 | int(b[pos+1]))
+	// Skip Compression Methods
+	if pos+1 > len(b) {
+		return 0
+	}
+	pos += 1 + int(b[pos])
+	// Extensions length
+	if pos+2 > len(b) {
+		return 0
+	}
+	extEnd := pos + 2 + (int(b[pos])<<8 | int(b[pos+1]))
+	pos += 2
+	if extEnd > len(b) {
+		extEnd = len(b)
+	}
+	for pos+4 <= extEnd {
+		extType := int(b[pos])<<8 | int(b[pos+1])
+		extLen := int(b[pos+2])<<8 | int(b[pos+3])
+		pos += 4
+		if extType == 0x0000 && pos+5 <= extEnd { // server_name extension
+			nameLen := int(b[pos+3])<<8 | int(b[pos+4])
+			nameStart := pos + 5
+			if nameStart+nameLen <= extEnd && nameLen > 2 {
+				return nameStart + (nameLen / 2)
+			}
+		}
+		pos += extLen
+	}
+	return 0
 }
 
 func findSNIBounds(handshake []byte) (int, int) {

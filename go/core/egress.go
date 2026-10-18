@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"netmerge/core/multipath"
 )
 
 // egressControl returns a Dialer Control func that binds the socket to the
@@ -171,7 +173,7 @@ func (e *Engine) dialWith(sl *Slot, f Family, proto, host string, port int, time
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return d.DialContext(ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
+	return multipath.DialBoundContext(ctx, &d, network, net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
 func (e *Engine) dialBoundUDP(sl *Slot, f Family, host string, port int) (net.Conn, error) {

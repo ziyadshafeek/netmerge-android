@@ -19,7 +19,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
@@ -107,7 +106,9 @@ func newEngine(tunFd int, protector Protector, cfg config) (*Engine, error) {
 			// real LAN interface, so without this such SYNs are dropped
 			// as martians.
 			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
-			ipv6.NewProtocolWithOptions(ipv6.Options{}),
+			// NOTE: no IPv6 protocol — the upstream path is IPv4-only by
+			// design (A-only DNS, clatd/NAT64 for v4). IPv6 packets arriving
+			// on the TUN are dropped here so the carrier /64 can never leak.
 		},
 		TransportProtocols: []stack.TransportProtocolFactory{
 			func(st *stack.Stack) stack.TransportProtocol { return tcp.NewProtocol(st) },
@@ -124,7 +125,6 @@ func newEngine(tunFd int, protector Protector, cfg config) (*Engine, error) {
 	}
 	s.SetRouteTable([]tcpip.Route{
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
-		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
 
 	// Tune gVisor's TCP stack for high-BDP dual-link (Wi-Fi + 5G) bonding.

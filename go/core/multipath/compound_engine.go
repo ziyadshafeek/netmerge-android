@@ -127,7 +127,7 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 		go func() {
 			for res := range standbyCh {
 				if res.err == nil && res.conn != nil {
-					PutWarmConn(res.link, res.ip, port, res.conn)
+					PutWarmConn(res.link, ep.Domain, res.ip, port, res.conn)
 				}
 			}
 		}()
@@ -251,7 +251,7 @@ func (e *OnPhoneCompoundEngine) ForwardWithMidHandshakeReplay(
 						canonIP = cCanon
 					}
 					d := NewBoundDialer(e.Binder, activeLink, 4*time.Second)
-					if directConn, dErr := d.DialContext(ctx, "tcp", net.JoinHostPort(canonIP, port)); dErr == nil {
+					if directConn, dErr := DialBoundContext(ctx, d, "tcp", net.JoinHostPort(canonIP, port)); dErr == nil {
 						activeUpstream.Close()
 						activeUpstream = directConn
 						if _, err := WriteClientHello(activeUpstream, firstPayload[:n]); err != nil {
@@ -334,7 +334,7 @@ func (e *OnPhoneCompoundEngine) dialSplicerLink(ctx context.Context, link LinkTy
 			}
 		}
 	}
-	return DialLinkConn(ctx, e.Binder, link, ip, fallbackIP, port)
+	return DialLinkConn(ctx, e.Binder, link, "", ip, fallbackIP, port)
 }
 
 // selectSegmentSize returns the segment size for the given segment index:
@@ -372,7 +372,7 @@ func (e *OnPhoneCompoundEngine) compoundHTTPStream(
 	go func() {
 		for res := range standbyCh {
 			if res.err == nil && res.conn != nil {
-				PutWarmConn(res.link, res.ip, port, res.conn)
+				PutWarmConn(res.link, ep.Domain, res.ip, port, res.conn)
 			}
 		}
 	}()

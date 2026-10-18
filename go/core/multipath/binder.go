@@ -1,6 +1,7 @@
 package multipath
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -45,6 +46,20 @@ var spliceBufferPool = sync.Pool{
 		buf := make([]byte, spliceBufSize)
 		return &buf
 	},
+}
+
+// DialBoundContext dials through a bound dialer, forcing the "tcp4" network
+// for IPv4 targets. Go's "tcp" with an IPv4 literal already selects AF_INET,
+// but making it explicit guarantees the kernel never applies AF_INET6
+// dual-stack MSS math (the IPv6-vs-IPv4 20-byte header delta) to an IPv4
+// connection — the mechanism behind the JA4T "..._1200_7" tunnel flag.
+func DialBoundContext(ctx context.Context, dialer *net.Dialer, network, address string) (net.Conn, error) {
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() != nil && network == "tcp" {
+			network = "tcp4"
+		}
+	}
+	return dialer.DialContext(ctx, network, address)
 }
 
 // NewBoundDialer creates a net.Dialer strictly pinned to the target physical interface

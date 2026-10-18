@@ -168,12 +168,18 @@ var (
 	warmPool = make(map[string][]warmConn)
 )
 
-func warmKey(link LinkType, ip, port string) string {
-	return string(rune('0'+link)) + "|" + ip + "|" + port
+func warmKey(link LinkType, domain, ip, port string) string {
+	base := string(rune('0'+link)) + "|" + ip + "|" + port
+	if domain != "" {
+		// Domain-scoped: a socket warmed for one domain/subdomain is never
+		// popped for another, even when they share a CDN edge IP.
+		return domain + "|" + base
+	}
+	return base
 }
 
-func popWarmConn(link LinkType, ip, port string) net.Conn {
-	k := warmKey(link, ip, port)
+func popWarmConn(link LinkType, domain, ip, port string) net.Conn {
+	k := warmKey(link, domain, ip, port)
 	now := time.Now()
 	warmMu.Lock()
 	defer warmMu.Unlock()
@@ -196,11 +202,11 @@ func popWarmConn(link LinkType, ip, port string) net.Conn {
 	return nil
 }
 
-func PutWarmConn(link LinkType, ip, port string, c net.Conn) {
+func PutWarmConn(link LinkType, domain, ip, port string, c net.Conn) {
 	if c == nil || ip == "" {
 		return
 	}
-	k := warmKey(link, ip, port)
+	k := warmKey(link, domain, ip, port)
 	warmMu.Lock()
 	list := warmPool[k]
 	if len(list) >= 4 {
@@ -254,8 +260,8 @@ var cellDualExitToggle atomic.Uint64
 // DialLinkConn dials a single link with automatic Jio 4G/5G IPv6 <-> 464XLAT IPv4
 // failover so a 5G -> 4G handover never stalls on dead sockets or unrouted NAT64.
 // Every returned connection is wrapped in MorphingConn for L4 stream morphing.
-func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, fallbackIPv4, port string) (net.Conn, error) {
-	if c := popWarmConn(link, ip, port); c != nil {
+func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, domain, ip, fallbackIPv4, port string) (net.Conn, error) {
+	if c := popWarmConn(link, domain, ip, port); c != nil {
 		return WrapMorphingConn(c, link), nil
 	}
 	d := NewBoundDialer(binder, link, 3500*time.Millisecond)
@@ -275,7 +281,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 		if parsed != nil && parsed.To4() != nil && cellDualExitToggle.Add(1)%2 == 0 {
 			if nat64 := SynthesizeCarrierNAT64(parsed); nat64 != "" {
 				natCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
-				c, err := d.DialContext(natCtx, "tcp", net.JoinHostPort(nat64, port))
+				c, err := DialBoundContext(natCtx, d, "tcp", net.JoinHostPort(nat64, port))
 				cancel()
 				if err == nil && c != nil {
 					if tc, ok := c.(*net.TCPConn); ok {
@@ -287,7 +293,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 			}
 		}
 	}
-	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+	c, err := DialBoundContext(ctx, d, "tcp", net.JoinHostPort(ip, port))
 	if err != nil && link == LinkCellular {
 		// Evict any stale 5G sockets cached in warmPool when a cellular dial fails.
 		PurgeWarmPool()
@@ -296,7 +302,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 		// 5G -> 4G switch), immediately try raw IPv4 via Android 464XLAT (clatd)!
 		if (parsedIP == nil || parsedIP.To4() == nil) && fallbackIPv4 != "" {
 			if fb4 := net.ParseIP(fallbackIPv4); fb4 != nil && fb4.To4() != nil {
-				c, err = d.DialContext(ctx, "tcp", net.JoinHostPort(fb4.String(), port))
+				c, err = DialBoundContext(ctx, d, "tcp", net.JoinHostPort(fb4.String(), port))
 			}
 		}
 		// 2. If raw IPv4 also failed (CLAT still warming up), try synthesized NAT64.
@@ -307,7 +313,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 			}
 			if targetIP4 != nil && targetIP4.To4() != nil {
 				if nat64 := SynthesizeCarrierNAT64(targetIP4); nat64 != "" {
-					c, err = d.DialContext(ctx, "tcp", net.JoinHostPort(nat64, port))
+					c, err = DialBoundContext(ctx, d, "tcp", net.JoinHostPort(nat64, port))
 				}
 			}
 		}
@@ -416,7 +422,7 @@ func DialSpeculativeDualLink(
 			}
 		}
 		start := time.Now()
-		c, dErr := DialLinkConn(ctx, binder, link, ip, otherIP, port)
+		c, dErr := DialLinkConn(ctx, binder, link, ep.Domain, ip, otherIP, port)
 		if dErr != nil && link == preferred {
 			prefFailedOnce.Do(func() { close(prefFailed) })
 		}
@@ -518,7 +524,7 @@ func DialRace(ctx context.Context, binder SocketBinder, wifiAddr, cellAddr, port
 	go func() {
 		for res := range standbyCh {
 			if res.err == nil && res.conn != nil {
-				PutWarmConn(res.link, res.ip, port, res.conn)
+				PutWarmConn(res.link, "", res.ip, port, res.conn)
 			}
 		}
 	}()

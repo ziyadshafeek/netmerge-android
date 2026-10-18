@@ -259,7 +259,9 @@ func NewVIPResolver(binder SocketBinder) *VIPResolver {
 func newBoundDoHClient(binder SocketBinder, link LinkType, sni string) *http.Client {
 	dialer := NewBoundDialer(binder, link, 1200*time.Millisecond)
 	tr := &http.Transport{
-		DialContext:         dialer.DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return DialBoundContext(ctx, dialer, network, addr)
+		},
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        8,
 		MaxIdleConnsPerHost: 4,
@@ -615,7 +617,7 @@ func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonical
 		probeCtx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
 		defer cancel()
 		d := NewBoundDialer(r.binder, link, 400*time.Millisecond)
-		probeConn, err := d.DialContext(probeCtx, "tcp", net.JoinHostPort(secondary, "443"))
+		probeConn, err := DialBoundContext(probeCtx, d, "tcp", net.JoinHostPort(secondary, "443"))
 		if err != nil || probeConn == nil {
 			return
 		}
@@ -634,7 +636,7 @@ func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonical
 		// 0-byte socket and place it into warmPool under canonicalIP.
 		warmCtx, wCancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 		defer wCancel()
-		cleanConn, err := d.DialContext(warmCtx, "tcp", net.JoinHostPort(secondary, "443"))
+		cleanConn, err := DialBoundContext(warmCtx, d, "tcp", net.JoinHostPort(secondary, "443"))
 		if err != nil || cleanConn == nil {
 			return
 		}
@@ -642,7 +644,7 @@ func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonical
 			_ = tc.SetNoDelay(true)
 		}
 		armKeepAlive(cleanConn)
-		PutWarmConn(link, canonicalIP, "443", cleanConn)
+		PutWarmConn(link, domain, canonicalIP, "443", cleanConn)
 	}()
 }
 

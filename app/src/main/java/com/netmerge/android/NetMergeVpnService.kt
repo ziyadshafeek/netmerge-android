@@ -121,13 +121,19 @@ class NetMergeVpnService : VpnService() {
         val pfd = try {
             Builder()
                 .setSession("NetMerge")
-                .addAddress("10.8.0.2", 32)
+                // RFC 1918 LAN-style addressing: 10.8.0.2 is a well-known
+                // OpenVPN default that fingerprinting scripts flag as a tunnel.
+                .addAddress("192.168.18.2", 24)
+                // ULA so Android treats the TUN as IPv6-capable (with the ::/0
+                // routes below, v6 is captured, not leaked via rmnet). The Go
+                // netstack has no IPv6 protocol, so v6 fails closed.
+                .addAddress("fd00:1::2", 128)
                 .addRoute("0.0.0.0", 1)
                 .addRoute("128.0.0.0", 1)
                 // IPv6 /1 pair too, otherwise v6 traffic silently bypasses the VPN
                 .addRoute("::", 1)
                 .addRoute("8000::", 1)
-                .addDnsServer("10.8.0.1")
+                .addDnsServer("192.168.18.1")
                 .setMtu(1500)
                 .setBlocking(false)
                 .establish()
