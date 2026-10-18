@@ -142,6 +142,7 @@ func (m *bucketRWMutex) NestedLock(_ bucketLockClass) { m.Lock() }
 
 // NestedUnlock unlocks the mutex.
 func (m *bucketRWMutex) NestedUnlock(_ bucketLockClass) { m.Unlock() }
+
 type transportEndpointsRWMutex struct{ sync.RWMutex }
 type endpointsByNICRWMutex struct{ sync.RWMutex }
 type multiPortEndpointRWMutex struct{ sync.RWMutex }

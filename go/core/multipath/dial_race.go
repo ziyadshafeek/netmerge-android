@@ -106,7 +106,15 @@ func StripedPreferredLink() LinkType {
 
 func TrackFlow(link LinkType) func() {
 	activeFlows[link].Add(1)
-	return func() { activeFlows[link].Add(-1) }
+	if fn, ok := flowHook.Load().(func(LinkType, int64)); ok && fn != nil {
+		fn(link, 1)
+	}
+	return func() {
+		activeFlows[link].Add(-1)
+		if fn, ok := flowHook.Load().(func(LinkType, int64)); ok && fn != nil {
+			fn(link, -1)
+		}
+	}
 }
 
 // Pre-Warmed Socket Pool: stores unused standby sockets (0 bytes written)
@@ -173,13 +181,10 @@ func PurgeWarmPool() {
 	}
 }
 
-// wrapMorph returns c wrapped in MorphingConn, skipping the wrap when c is
-// already wrapped (warmPool mixes raw and previously-wrapped standby conns).
-func wrapMorph(c net.Conn, link LinkType) net.Conn {
-	if _, ok := c.(*MorphingConn); ok {
-		return c
-	}
-	return WrapMorphingConn(c, link)
+var flowHook atomic.Value // func(LinkType, int64)
+
+func SetFlowHook(fn func(LinkType, int64)) {
+	flowHook.Store(fn)
 }
 
 func toNAT64(ip4 net.IP) string {
@@ -207,14 +212,14 @@ var cellDualExitToggle atomic.Uint64
 // Every returned connection is wrapped in MorphingConn for L4 stream morphing.
 func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, fallbackIPv4, port string) (net.Conn, error) {
 	if c := popWarmConn(link, ip, port); c != nil {
-		return wrapMorph(c, link), nil
+		return WrapMorphingConn(c, link), nil
 	}
 	d := NewBoundDialer(binder, link, 3500*time.Millisecond)
 	if egress := GlobalPrivacy.EgressForLink(link); egress != nil && egress.Address != "" {
 		c, err := DialThroughPrivacyEgress(ctx, d, egress, "tcp", net.JoinHostPort(ip, port))
 		if err == nil && c != nil {
 			armKeepAlive(c)
-			return wrapMorph(c, link), nil
+			return WrapMorphingConn(c, link), nil
 		}
 		return nil, err
 	}
@@ -233,7 +238,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 						_ = tc.SetNoDelay(true)
 					}
 					armKeepAlive(c)
-					return wrapMorph(c, link), nil
+					return WrapMorphingConn(c, link), nil
 				}
 			}
 		}
@@ -268,7 +273,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 			_ = tc.SetNoDelay(true)
 		}
 		armKeepAlive(c)
-		return wrapMorph(c, link), nil
+		return WrapMorphingConn(c, link), nil
 	}
 	return c, err
 }

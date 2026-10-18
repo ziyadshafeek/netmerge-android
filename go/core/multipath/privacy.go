@@ -169,7 +169,6 @@ type MorphingConn struct {
 	net.Conn
 	link           LinkType
 	txMorphedBytes atomic.Int64
-	firstWrite     atomic.Bool
 }
 
 const maxMorphWindowBytes = 16 * 1024
@@ -186,27 +185,29 @@ func WrapMorphingConn(c net.Conn, link LinkType) net.Conn {
 	if _, ok := c.(*MorphingConn); ok {
 		return c
 	}
-	mc := &MorphingConn{
+	return &MorphingConn{
 		Conn: c,
 		link: link,
 	}
-	mc.firstWrite.Store(true)
-	return mc
+}
+
+// CloseWrite forwards TCP half-close (FIN) to the underlying *net.TCPConn.
+func (mc *MorphingConn) CloseWrite() error {
+	if cw, ok := mc.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 func (mc *MorphingConn) Write(b []byte) (int, error) {
-	if mc.firstWrite.CompareAndSwap(true, false) {
-		if GlobalPrivacy.TLSFragmentationEnabled() && isTLSClientHello(b) {
-			return writeFragmentedClientHello(mc.Conn, b)
-		}
-	}
-	// Apply L4 TCP segment boundary morphing to the first 16 KB of encrypted
-	// TLS Application Data (0x17) so ISP NetFlow/DPI packet-size classifiers
-	// never observe the true application record lengths.
+	// Only morph encrypted TLS 1.3 Application Data (0x17) at L4 TCP boundaries.
+	// ClientHello (0x16) fragmentation is handled exclusively by WriteClientHello
+	// so it is never double-fragmented!
 	if GlobalPrivacy.L4MorphingEnabled() &&
 		len(b) > 128 &&
 		b[0] == 0x17 &&
 		mc.txMorphedBytes.Load() < maxMorphWindowBytes {
+
 		mc.txMorphedBytes.Add(int64(len(b)))
 		var rnd [2]byte
 		GlobalPrivacy.FillCryptoRandom(rnd[:])
@@ -441,9 +442,8 @@ func isTLSClientHello(b []byte) bool {
 func WriteClientHello(conn net.Conn, b []byte) (int, error) {
 	if GlobalPrivacy.TLSFragmentationEnabled() && isTLSClientHello(b) {
 		// Unwrap MorphingConn first (loop: warmPool can hand back an already-
-		// wrapped standby conn): writeFragmentedClientHello writes rec1 through
-		// conn.Write, which would re-trigger MorphingConn's firstWrite branch
-		// and fragment rec1 a second time (3-4 records, SNI split lost).
+		// wrapped standby conn): writeFragmentedClientHello must write rec1/rec2
+		// straight to the raw socket so the SNI split lands exactly as designed.
 		for {
 			mc, ok := conn.(*MorphingConn)
 			if !ok {

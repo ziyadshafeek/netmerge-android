@@ -13,7 +13,7 @@ type recordProtector struct {
 	fds []int
 }
 
-func (p *recordProtector) Protect(fd int) { p.fds = append(p.fds, fd) }
+func (p *recordProtector) Protect(fd int)                              { p.fds = append(p.fds, fd) }
 func (p *recordProtector) BindAndProtect(fd int, networkType int) bool { return false }
 
 // The Control callback must pin the socket to the interface AND protect it,

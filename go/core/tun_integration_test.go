@@ -193,7 +193,7 @@ func TestTunIntegration(t *testing.T) {
 
 type noopProtector struct{}
 
-func (noopProtector) Protect(fd int) {}
+func (noopProtector) Protect(fd int)                              {}
 func (noopProtector) BindAndProtect(fd int, networkType int) bool { return false }
 
 func loIfIndex() (int, error) {
@@ -205,8 +205,8 @@ func loIfIndex() (int, error) {
 }
 
 const (
-	iffTun  = 0x0001
-	iffNoPI  = 0x1000
+	iffTun    = 0x0001
+	iffNoPI   = 0x1000
 	tunSetIFF = 0x400454ca
 )
 
@@ -407,8 +407,8 @@ func buildTCPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16,
 	ip[0] = 0x45
 	binary.BigEndian.PutUint16(ip[2:4], uint16(20+len(tcp)))
 	binary.BigEndian.PutUint16(ip[4:6], 0x1234) // id
-	ip[8] = 64                                 // ttl
-	ip[9] = 6                                  // TCP
+	ip[8] = 64                                  // ttl
+	ip[9] = 6                                   // TCP
 	copy(ip[12:16], srcIP.To4())
 	copy(ip[16:20], dstIP.To4())
 	binary.BigEndian.PutUint16(ip[10:12], ipChecksum(ip))

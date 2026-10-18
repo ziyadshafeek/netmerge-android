@@ -35,7 +35,7 @@ func (e *Engine) statsJSON() string {
 		rx := sl.bytesIn[Fam4].Load() + sl.bytesIn[Fam6].Load()
 		ns := netStat{
 			ID: sl.ID, DisplayName: sl.DisplayName, Transport: sl.Transport,
-			State: combinedState(sl).String(),
+			State:   combinedState(sl).String(),
 			TxBytes: tx, RxBytes: rx,
 			ActiveFlows: sl.active.Load(),
 			Weight:      round2(combinedWeight(sl)),

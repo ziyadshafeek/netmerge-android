@@ -697,47 +697,43 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 // queryODoHOnLink seals the DNS wire query with RFC 9180 HPKE (X25519 + AES-128-GCM)
 // and transmits it as an RFC 9230 application/oblivious-dns-message.
 func (r *VIPResolver) queryODoHOnLink(ctx context.Context, wireReq []byte, txID uint16, link LinkType) []net.IP {
-	cfg := GlobalODoH.GetTargetConfig(r, link)
-	if cfg == nil {
+	GlobalODoH.mu.RLock()
+	proxyURL := GlobalODoH.proxyURL
+	cfg := GlobalODoH.targetCfg
+	targetHost := GlobalODoH.targetHost
+	targetPath := GlobalODoH.targetPath
+	GlobalODoH.mu.RUnlock()
+
+	// Do not block DNS lookups if ODoH proxy or target key is not configured yet.
+	if proxyURL == "" || cfg == nil {
 		return nil
 	}
 	odohReq, cctx, err := cfg.SealQuery(wireReq)
 	if err != nil {
 		return nil
 	}
-	// Select the bound HTTP/2 client on this link to carry the oblivious message.
 	endpointURL := "https://1.1.1.1/dns-query"
 	if link == LinkCellular {
 		endpointURL = "https://[2606:4700:4700::1111]/dns-query"
 	}
 	client := r.dohClients[dohClientKey(link, endpointURL)]
 	if client == nil {
-		client = r.dohClients[dohClientKey(link, "https://1.1.1.1/dns-query")]
-	}
-	if client == nil {
 		return nil
 	}
-	GlobalODoH.mu.RLock()
-	proxyURL := GlobalODoH.proxyURL
-	targetHost := GlobalODoH.targetHost
-	targetPath := GlobalODoH.targetPath
-	GlobalODoH.mu.RUnlock()
-	reqURL := endpointURL
-	if proxyURL != "" {
-		reqURL = proxyURL + "?targethost=" + targetHost + "&targetpath=" + targetPath
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(odohReq))
+
+	reqCtx, cancel := context.WithTimeout(ctx, 450*time.Millisecond)
+	defer cancel()
+	reqURL := proxyURL + "?targethost=" + targetHost + "&targetpath=" + targetPath
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, reqURL, bytes.NewReader(odohReq))
 	if err != nil {
 		return nil
-	}
-	if proxyURL == "" && targetHost != "" {
-		req.Host = targetHost
 	}
 	req.Header.Set("Content-Type", "application/oblivious-dns-message")
 	req.Header.Set("Accept", "application/oblivious-dns-message")
-	req.Header.Set("Cache-Control", "no-cache, no-store")
+
 	resp, err := client.Do(req)
 	if err != nil {
+		client.CloseIdleConnections()
 		return nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -752,7 +748,6 @@ func (r *VIPResolver) queryODoHOnLink(ctx context.Context, wireReq []byte, txID 
 	}
 	return parseDNSResponsePacket(dnsResp, txID)
 }
-
 func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {
 	if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
 		return ips
