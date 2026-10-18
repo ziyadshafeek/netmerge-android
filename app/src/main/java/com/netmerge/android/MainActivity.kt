@@ -5,8 +5,11 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -67,6 +70,7 @@ class MainActivity : ComponentActivity() {
         } catch (t: Throwable) {
             NetMergeState.error.value = "Native library failed to load: ${t.message}"
         }
+        ensureBatteryOptimizationExempt()
         setContent {
             NetMergeTheme {
                 Surface(
@@ -353,5 +357,19 @@ fun HowItWorksCard() {
                 lineHeight = 19.sp
             )
         }
+    }
+    // ColorOS / OxygenOS / MIUI freeze background work unless the app is on
+    // Android's Doze whitelist. Prompt once on launch.
+    private fun ensureBatteryOptimizationExempt() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        try {
+            val pm = getSystemService(PowerManager::class.java) ?: return
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            }
+        } catch (_: Exception) { }
     }
 }

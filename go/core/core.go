@@ -20,6 +20,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"sync"
 )
 
@@ -75,6 +76,12 @@ func Start(tunFd int, protector Protector, configJSON string) (errStr string) {
 	if tunFd < 0 {
 		return "invalid tun fd"
 	}
+	// Keep the Go runtime's footprint small so Android's lmkd never targets
+	// the VPN process during high-concurrency bursts. The limit is soft:
+	// Go GCs aggressively to stay under it but never crashes if live heap
+	// (e.g. gVisor's 4MB per-connection windows) genuinely needs more.
+	debug.SetGCPercent(50)
+	debug.SetMemoryLimit(64 << 20)
 	if protector == nil {
 		return "protector is nil"
 	}

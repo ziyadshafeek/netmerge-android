@@ -13,6 +13,8 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -50,6 +52,11 @@ class NetMergeVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var tunFd: Int = -1
     private var engineStarted = false
+
+    // OEM-killer immunity: held while the tunnel is up so Doze / battery
+    // savers (ColorOS, OxygenOS, MIUI, OneUI) can't freeze the Go runtime.
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private var connectivityManager: ConnectivityManager? = null
     private var cellularCallback: ConnectivityManager.NetworkCallback? = null
@@ -111,6 +118,7 @@ class NetMergeVpnService : VpnService() {
 
     private fun startEngine() {
         if (engineStarted) return // already running; ignore duplicate start
+        acquireLocks()
         try {
             Core.touch()
         } catch (t: Throwable) {
@@ -135,7 +143,13 @@ class NetMergeVpnService : VpnService() {
                 .addRoute("8000::", 1)
                 .addDnsServer("192.168.18.1")
                 .setMtu(1500)
-                .setBlocking(false)
+                .setBlocking(true)
+                .apply {
+                    // Never let Android throttle background data inside the VPN.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        setMetered(false)
+                    }
+                }
                 .establish()
         } catch (t: Throwable) {
             Log.w(TAG, "establish failed", t)
@@ -407,7 +421,37 @@ class NetMergeVpnService : VpnService() {
 
     // ---- teardown ----
 
+    private fun acquireLocks() {
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            if (wakeLock == null) {
+                wakeLock = pm?.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK, "NetMerge::tunnel"
+                )?.apply {
+                    setReferenceCounted(false)
+                    if (!isHeld) acquire()
+                }
+            }
+            val wm = applicationContext.getSystemService(WifiManager::class.java)
+            if (wifiLock == null) {
+                wifiLock = wm?.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "NetMerge::tunnel"
+                )?.apply { if (!isHeld) acquire() }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "lock acquire failed", t)
+        }
+    }
+
+    private fun releaseLocks() {
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
+        wakeLock = null
+        try { wifiLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
+        wifiLock = null
+    }
+
     private fun shutdownEngine() {
+        releaseLocks()
         unregisterNetworkTracking()
         connectivityManager = null
         pushJob?.cancel()
@@ -434,6 +478,19 @@ class NetMergeVpnService : VpnService() {
             } catch (_: Exception) {
             }
         }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swiping the UI from Recents must never kill the tunnel:
+        // stopWithTask="false" + START_STICKY keep the foreground service alive.
+        super.onTaskRemoved(rootIntent)
+    }
+
+    override fun onRevoke() {
+        // System revoked VPN permission (user toggled it off elsewhere).
+        shutdownEngine()
+        stopSelf()
+        super.onRevoke()
     }
 
     override fun onDestroy() {
