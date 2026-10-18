@@ -61,6 +61,8 @@ class NetMergeVpnService : VpnService() {
     private var connectivityManager: ConnectivityManager? = null
     private var cellularCallback: ConnectivityManager.NetworkCallback? = null
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+    private var ethernetCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var ethernetNetwork: Network? = null
     private var pushJob: Job? = null
     private var statsJob: Job? = null
 
@@ -80,8 +82,9 @@ class NetMergeVpnService : VpnService() {
             val intFd = fd.toInt()
             // networkType: 1 = Wi-Fi, 2 = Cellular
             val targetNet = when (networkType) {
-                1L -> wifiNetwork
-                2L -> cellNetwork
+                // Prefer zero-jitter USB/Ethernet when plugged in.
+                1L -> wifiNetwork ?: ethernetNetwork
+                2L -> ethernetNetwork ?: cellNetwork
                 else -> null
             } ?: return false
             return try {
@@ -246,6 +249,30 @@ class NetMergeVpnService : VpnService() {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = schedulePush()
             }
             cm.requestNetwork(cellReq, cellularCallback!!)
+            // USB tethering / RNDIS / Ethernet: zero-jitter offload when plugged in.
+            val ethReq = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .addTransportType(NetworkCapabilities.TRANSPORT_USB)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            ethernetCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    ethernetNetwork = network
+                    Log.i(TAG, "ethernet/usb available: $network")
+                    schedulePush()
+                }
+                override fun onLost(network: Network) {
+                    if (ethernetNetwork == network) {
+                        ethernetNetwork = null
+                        Log.i(TAG, "ethernet/usb lost")
+                        schedulePush()
+                    }
+                }
+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = schedulePush()
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = schedulePush()
+            }
+            try { cm.requestNetwork(ethReq, ethernetCallback!!) } catch (_: Throwable) {}
             Log.i(TAG, "requested both cellular and wifi networks")
         } catch (t: Throwable) {
             Log.w(TAG, "requestNetwork failed", t)
@@ -257,8 +284,10 @@ class NetMergeVpnService : VpnService() {
         val cm = connectivityManager ?: return
         try { wifiCallback?.let { cm.unregisterNetworkCallback(it) } } catch (_: Exception) {}
         try { cellularCallback?.let { cm.unregisterNetworkCallback(it) } } catch (_: Exception) {}
+        try { ethernetCallback?.let { cm.unregisterNetworkCallback(it) } } catch (_: Exception) {}
         wifiCallback = null
         cellularCallback = null
+        ethernetCallback = null
     }
 
     private fun schedulePush() {

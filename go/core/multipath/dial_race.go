@@ -436,7 +436,14 @@ func DialSpeculativeDualLink(
 		wg.Add(1)
 		go func() { defer wg.Done(); dialOne(LinkWiFi, wifiAddr, cellAddr) }()
 	}
-	if cellAddr != "" {
+	// RRC power governor: skip the cellular racer when Wi-Fi alone is healthy,
+	// unsaturated and unbloated — the 5G modem stays in RRC_IDLE (~0mW) until
+	// a burst, bloat, or bulk demand wakes it. Always engages when Wi-Fi is down.
+	cellularEngaged := true
+	if GlobalRRCGovernor != nil {
+		cellularEngaged = GlobalRRCGovernor.ShouldEngageCellular(0)
+	}
+	if cellAddr != "" && cellularEngaged {
 		n++
 		// Always pass cellRawV4 as fallbackIPv4 even when wifiAddr is "" (Wi-Fi off)!
 		cellFallback := cellRawV4

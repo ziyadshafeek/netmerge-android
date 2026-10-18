@@ -379,12 +379,20 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) (handled bool) {
 
 	// Privacy leak lockdown + QUIC/DoT blocking BEFORE CreateEndpoint so gVisor
 	// emits ICMP Port Unreachable and apps fall back in <1ms:
-	// - UDP 443 (QUIC): forces multi-connection TCP 443 (SNI slicing + bonding)
+	// - UDP 443 (QUIC): governed by ElephantQUICGuard (mice on QUIC, elephants evicted to TCP)
 	// - 853 (DoT): forces fallback to the sharded DoH VIP resolver
 	// - 5353/5355/1900/137-139 (mDNS/LLMNR/SSDP/NetBIOS): blocks LAN identity leaks
 	// - STUN/TURN ports: blocks WebRTC IP leaks (falls back to TURN/TCP)
 	if multipath.ShouldBlockPrivacyLeak(true, nil, dstPort) || (dstPort != 53 && isSyntheticVIP(dstIP)) {
 		return false
+	}
+	// ElephantQUICGuard: a recently-evicted elephant QUIC flow is in cooldown;
+	// refuse the new session so gVisor emits ICMP Port Unreachable and the app
+	// falls back to multi-connection bonded TCP (<1ms).
+	if dstPort == 443 && e.mpEngine != nil && e.mpEngine.QUICGuard != nil {
+		if e.mpEngine.QUICGuard.ShouldBlockNewQUIC(0, dstHost, uint16(dstPort)) {
+			return false
+		}
 	}
 
 	key := udpKey(f, id)
@@ -550,8 +558,14 @@ func (e *Engine) relayUDP(us *udpSession, clientAddr *net.UDPAddr) {
 				}
 			}
 
-			// Note: QUIC (UDP/443) is blocked upfront in handleUDP with ICMP
-			// Port Unreachable, so no QUICGuard eviction is needed here.
+			// ElephantQUICGuard: bulk QUIC flows (>=2.5MB at >500KB/s) are
+			// evicted here — the session closes and the 90s cooldown forces
+			// the app to resume over multi-connection bonded TCP.
+			if us.dstPort == 443 && e.mpEngine != nil && e.mpEngine.QUICGuard != nil {
+				if e.mpEngine.QUICGuard.OnUDPPacket(us.key, 0, us.dstHost, uint16(us.dstPort), n, true) {
+					return
+				}
+			}
 
 			// Live STUN payload firewall: block WebRTC STUN Magic Cookie
 			// (0x2112A442) on any UDP port using the actual packet bytes.

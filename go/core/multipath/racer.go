@@ -18,6 +18,7 @@ type Racer struct {
 }
 
 func NewRacer(binder SocketBinder, resolver *VIPResolver, scheduler *Scheduler) *Racer {
+	InitRRCGovernor(binder, scheduler)
 	r := &Racer{
 		binder:    binder,
 		resolver:  resolver,
@@ -27,27 +28,10 @@ func NewRacer(binder SocketBinder, resolver *VIPResolver, scheduler *Scheduler) 
 	return r
 }
 
-// startCellularKeepAwake prevents the 5G NR modem from dropping into deep RRC_IDLE
-// sleep when Wi-Fi is carrying long-lived flows, keeping 5G carrier aggregation ready.
-func (r *Racer) startCellularKeepAwake() {
-	r.pacerOnce.Do(func() {
-		go func() {
-			ticker := time.NewTicker(6 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				wStats := r.scheduler.Stats(LinkWiFi)
-				cStats := r.scheduler.Stats(LinkCellular)
-				if wStats.ActiveFlows > 0 && cStats.ActiveFlows == 0 {
-					ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
-					if r.resolver != nil {
-						_ = r.resolver.queryUDPOnLink(ctx, "cloudflare.com", 28, LinkCellular)
-					}
-					cancel()
-				}
-			}
-		}()
-	})
-}
+// startCellularKeepAwake is a no-op: RRCPowerGovernor wakes 5G NR on demand
+// only when Wi-Fi BDP saturates (>65%), Wi-Fi SRTT bloats (>1.35x MinRTT), or
+// a bulk transfer starts — replacing the unconditional 6-second DNS pinger.
+func (r *Racer) startCellularKeepAwake() {}
 
 // resolveLinkTargets resolves optimal per-link addresses and a Cellular fallback
 // address (so Cellular can seamlessly retry NAT64 IPv6 <-> raw IPv4 on connect).

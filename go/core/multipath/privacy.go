@@ -119,11 +119,10 @@ func (p *PrivacyEngine) L4MorphingEnabled() bool          { return p.l4Morphing.
 // ShouldBlockPrivacyLeak is the single choke point for side-channel and
 // identity leaks inside the gVisor forwarders.
 func ShouldBlockPrivacyLeak(isUDP bool, payload []byte, dstPort int) bool {
-	if isUDP && dstPort == 443 {
-		// Block QUIC (HTTP/3) so all HTTPS uses multi-connection TCP 443 with
-		// zero-suspicion SNI slicing, L4 stream morphing, and dual-radio bonding.
-		return true
-	}
+	// NOTE: UDP/443 (QUIC) is no longer blocked unconditionally. Interactive
+	// mice flows run natively over QUIC at 0-RTT speed; ElephantQUICGuard
+	// evicts bulk flows (>=2.5MB at >500KB/s) with ICMP Port Unreachable so
+	// they re-dial as multi-connection bonded TCP.
 	if !isUDP && dstPort == 53 {
 		// Block plaintext TCP/53 bypass (forces apps to use intercepted UDP/53 -> DoH).
 		return true
