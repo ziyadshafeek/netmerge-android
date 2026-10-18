@@ -31,11 +31,6 @@ const (
 	spliceBufSize = 256 * 1024
 )
 
-// L4 morphing state: per-socket DSCP rotation + window/MSS jitter so every
-// connection presents a distinct L3/L4 signature (JA4T / p0f evasion).
-var l4MorphSalt atomic.Uint64
-var dscpPool = [4]int{0x28, 0x48, 0x20, 0x00}
-
 // SocketBinder binds raw socket descriptors to physical Android Networks (Wi-Fi / Cellular)
 // and reports real-time per-link byte telemetry.
 type SocketBinder interface {
@@ -56,7 +51,7 @@ var spliceBufferPool = sync.Pool{
 }
 
 // NewBoundDialer creates a net.Dialer strictly pinned to the target physical interface
-// with pre-connect kernel socket tuning.
+// with herd-conformant Android Linux kernel socket parameters (zero JA4T anomalies).
 func NewBoundDialer(binder SocketBinder, link LinkType, timeout time.Duration) *net.Dialer {
 	if timeout <= 0 {
 		timeout = 6 * time.Second
@@ -72,9 +67,6 @@ func NewBoundDialer(binder SocketBinder, link LinkType, timeout time.Duration) *
 					return
 				}
 				rawFD := int(fd)
-				// Tune kernel socket buffers before SYN so TCP window scale factor is maximized.
-				// Fall back through 4MB -> 2MB -> 1MB (unprivileged sockets may be
-				// clamped by net.core.rmem_max/wmem_max).
 				for _, sz := range []int{socketBufSize, 2 * 1024 * 1024, 1024 * 1024} {
 					if syscall.SetsockoptInt(rawFD, syscall.SOL_SOCKET, syscall.SO_RCVBUF, sz) == nil {
 						break
@@ -85,22 +77,18 @@ func NewBoundDialer(binder SocketBinder, link LinkType, timeout time.Duration) *
 						break
 					}
 				}
-				salt := l4MorphSalt.Add(1)
-				dscp := dscpPool[salt&3]
-				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IP, syscall.IP_TOS, dscp)
-				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IPV6, ipv6TClass, dscp)
+				// Stock Android kernel herd conformity: default Best-Effort TOS (0x00)
+				// and canonical interface MSS (1360 Cellular / 1440 Wi-Fi) so JA4T
+				// never flags non-standard DSCP or weird MSS deltas.
+				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IP, syscall.IP_TOS, 0x00)
+				_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_IPV6, ipv6TClass, 0x00)
 				if network == "tcp" || network == "tcp4" || network == "tcp6" {
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpQuickAck, 1)
-					// Morph TCP_WINDOW_CLAMP and TCP_MAXSEG per flow to defeat JA4T / p0f
-					// cross-IP connection linking at the destination website.
-					winJitter := int((salt * 4096) & 0xFFFF)
-					_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpWindowClmp, socketBufSize-winJitter)
-					mssJitter := int((salt * 4) & 0x1C) // 0..28 byte MSS morph
 					if link == LinkCellular {
-						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, cellSafeMSS-mssJitter)
+						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, cellSafeMSS)
 					} else {
-						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, wifiSafeMSS-mssJitter)
+						_ = syscall.SetsockoptInt(rawFD, syscall.IPPROTO_TCP, tcpMaxSeg, wifiSafeMSS)
 					}
 				}
 			}); err != nil {

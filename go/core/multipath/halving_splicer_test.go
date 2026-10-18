@@ -19,8 +19,8 @@ import (
 // test traffic flows over loopback.
 type stubBinder struct{}
 
-func (stubBinder) BindAndProtect(fd int64, networkType int) bool { return true }
-func (stubBinder) CanBindLink(networkType int) bool               { return true }
+func (stubBinder) BindAndProtect(fd int64, networkType int) bool   { return true }
+func (stubBinder) CanBindLink(networkType int) bool                { return true }
 func (stubBinder) OnBytes(networkType int, rxBytes, txBytes int64) {}
 
 // rangeHandler serves data with HTTP Range + ETag support. If ifRangeFail

@@ -9,12 +9,12 @@ import (
 // buildDNSQuery crafts a minimal DNS query for domain/qtype.
 func buildDNSQuery(domain string, qtype uint16) []byte {
 	var q []byte
-	q = append(q, 0x12, 0x34)       // txid
-	q = append(q, 0x01, 0x00)       // flags: RD
-	q = append(q, 0x00, 0x01)       // qdcount=1
-	q = append(q, 0x00, 0x00)       // ancount
-	q = append(q, 0x00, 0x00)       // nscount
-	q = append(q, 0x00, 0x00)       // arcount
+	q = append(q, 0x12, 0x34) // txid
+	q = append(q, 0x01, 0x00) // flags: RD
+	q = append(q, 0x00, 0x01) // qdcount=1
+	q = append(q, 0x00, 0x00) // ancount
+	q = append(q, 0x00, 0x00) // nscount
+	q = append(q, 0x00, 0x00) // arcount
 	for _, l := range splitLabels(domain) {
 		q = append(q, byte(len(l)))
 		q = append(q, []byte(l)...)

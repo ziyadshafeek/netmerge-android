@@ -3,8 +3,8 @@ package multipath
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"io"
 	"net"
@@ -34,7 +34,6 @@ func SynthesizeCarrierNAT64(ip4 net.IP) string {
 	nat64PrefixMu.RLock()
 	pfx := nat64Prefix
 	nat64PrefixMu.RUnlock()
-
 	out := make(net.IP, 16)
 	copy(out[0:12], pfx[:])
 	out[12] = v4[0]
@@ -61,7 +60,6 @@ type DualEndpoint struct {
 
 // NextAddrs rotates across all DNS-verified edge IPs so consecutive flows
 // spread over the CDN's full edge set instead of pinning the first IP.
-// Falls back to WiFiAddr/CellAddr when pools are empty.
 func (ep *DualEndpoint) NextAddrs() (string, string) {
 	ep.mu.RLock()
 	defer ep.mu.RUnlock()
@@ -113,13 +111,12 @@ type domainVIPRing struct {
 }
 
 type VIPResolver struct {
-	mu       sync.RWMutex
-	vipToDom map[uint32]*DualEndpoint
-	domToVIP map[string]*domainVIPRing
-	nextVIP  atomic.Uint32
-
+	mu         sync.RWMutex
+	vipToDom   map[uint32]*DualEndpoint
+	domToVIP   map[string]*domainVIPRing
+	nextVIP    atomic.Uint32
 	binder     SocketBinder
-	dohClients map[string]*http.Client // Keyed by "link|url" so Cellular never overwrites Wi-Fi!
+	dohClients map[string]*http.Client
 	dohNext    atomic.Uint64
 	resolve    func(ctx context.Context, domain string) (string, string)
 }
@@ -212,7 +209,6 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 		return nil, nil
 	}
 	r.maybeDiscoverNAT64Prefix()
-
 	r.mu.RLock()
 	if ring, ok := r.domToVIP[domain]; ok {
 		r.mu.RUnlock()
@@ -229,7 +225,6 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 		return vipFromInt(pick), ring.ep
 	}
 	r.mu.RUnlock()
-
 	if r.resolve != nil {
 		w, c := r.resolve(ctx, domain)
 		if w == "" && c == "" {
@@ -259,7 +254,6 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 		r.mu.Unlock()
 		return vipFromInt(ring.vips[0]), ep
 	}
-
 	r.mu.Lock()
 	if ring, ok := r.domToVIP[domain]; ok {
 		r.mu.Unlock()
@@ -273,7 +267,6 @@ func (r *VIPResolver) GetOrAllocate(ctx context.Context, domain string) (net.IP,
 	ep.refreshing.Store(true)
 	ring := r.allocateRingLocked(domain, ep)
 	r.mu.Unlock()
-
 	go func() {
 		defer ep.refreshing.Store(false)
 		r.populateEndpoint(ep)
@@ -306,10 +299,8 @@ func (r *VIPResolver) LookupVIP(ip net.IP) (*DualEndpoint, bool) {
 
 func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	defer ep.markReady()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
 	defer cancel()
-
 	type res struct {
 		link  LinkType
 		addr  string
@@ -317,11 +308,6 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		pool  []string
 	}
 	ch := make(chan res, 2)
-
-	// Cross-Radio Oblivious Sharding: Wi-Fi and Cellular resolve concurrently
-	// over distinct zero-log DoH authorities; if one radio is offline (e.g. BSNL
-	// cellular only), its bind fails fast (<1ms) and applyEndpointAddrs mirrors
-	// the working radio's IP.
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkWiFi, false)
 		r.fireDecoyDoHChaff(LinkWiFi)
@@ -344,7 +330,6 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		}
 		ch <- res{link: LinkWiFi, addr: addr, pool: pool}
 	}()
-
 	go func() {
 		ips := r.lookupOnLink(ctx, ep.Domain, LinkCellular, true)
 		r.fireDecoyDoHChaff(LinkCellular)
@@ -374,7 +359,6 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		}
 		ch <- res{link: LinkCellular, addr: addr, rawV4: rawV4, pool: pool}
 	}()
-
 	var wAddr, cAddr, cRawV4 string
 	var wPool, cPool []string
 	first := <-ch
@@ -383,7 +367,6 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 	} else {
 		cAddr, cRawV4, cPool = first.addr, first.rawV4, first.pool
 	}
-
 	graceTimer := time.NewTimer(50 * time.Millisecond)
 	select {
 	case second := <-ch:
@@ -397,12 +380,10 @@ func (r *VIPResolver) populateEndpoint(ep *DualEndpoint) {
 		return
 	case <-graceTimer.C:
 	}
-
 	if wAddr != "" || cAddr != "" {
 		r.applyEndpointAddrs(ep, wAddr, cAddr, cRawV4, wPool, cPool)
 		ep.markReady()
 	}
-
 	second := <-ch
 	if second.link == LinkWiFi {
 		wAddr, wPool = second.addr, second.pool
@@ -444,16 +425,13 @@ func (r *VIPResolver) applyEndpointAddrs(ep *DualEndpoint, w, c, cRawV4 string, 
 	if ep.WiFiAddr != "" || ep.CellAddr != "" {
 		ep.Updated = time.Now()
 	}
-	wFinal, cFinal := ep.WiFiAddr, ep.CellAddr
+	wFinal, cFinal, dom := ep.WiFiAddr, ep.CellAddr, ep.Domain
 	ep.mu.Unlock()
-
-	// Background-verify Anycast siblings for both radios (never blocks the
-	// user path; only verified sockets enter warmPool).
 	if wFinal != "" {
-		r.maybeWarmAnycastSibling(LinkWiFi, wFinal)
+		r.verifyAndWarmAnycastCloak(LinkWiFi, dom, wFinal)
 	}
 	if cFinal != "" {
-		r.maybeWarmAnycastSibling(LinkCellular, cFinal)
+		r.verifyAndWarmAnycastCloak(LinkCellular, dom, cFinal)
 	}
 }
 
@@ -466,13 +444,9 @@ var decoyDomains = []string{
 	"www.ietf.org",
 }
 
-// fireDecoyDoHChaff sends an asynchronous, zero-latency decoy DoH query over an
-// already-open HTTP/2 DoH connection on an alternate authority, blinding ISP
-// timing/volume correlation without adding a single millisecond to user traffic.
 func (r *VIPResolver) fireDecoyDoHChaff(link LinkType) {
 	var rnd [1]byte
-	_, _ = rand.Read(rnd[:])
-	// Fire on ~50% of lookups so chaff volume itself is non-deterministic.
+	GlobalPrivacy.FillCryptoRandom(rnd[:])
 	if rnd[0]&1 == 0 {
 		return
 	}
@@ -484,9 +458,6 @@ func (r *VIPResolver) fireDecoyDoHChaff(link LinkType) {
 	}()
 }
 
-// Shared Anycast front IPs (Cloudflare / Fastly global anycast ingress) that
-// hide the specific customer IP range from the ISP while terminating on the
-// exact same local Indian PoP hardware.
 var sharedCloudflareFronts = []string{
 	"104.16.132.229",
 	"104.16.133.229",
@@ -511,20 +482,21 @@ func isCloudflareAnycast(ip net.IP) bool {
 	return false
 }
 
-// maybeWarmAnycastSibling pre-connects a cloaked Anycast front/sibling IP in
-// the background and stores it in warmPool under canonicalIP. Because
-// ForwardWithMidHandshakeReplay checks isInvalidTLSResponse() and replays the
-// buffered ClientHello onto canonicalIP if the server returns a TLS Alert (0x15),
-// this hides the destination IP from the ISP with ZERO risk of breaking sites!
-func (r *VIPResolver) maybeWarmAnycastSibling(link LinkType, canonicalIP string) {
+// verifyAndWarmAnycastCloak solves the v4 TLS Alert & ClientHello.random replay
+// leak: it first verifies a candidate Anycast cloak IP in the background using
+// a disposable RFC 8446 probe ClientHello with a fresh CSPRNG nonce. ONLY if
+// the cloak IP responds with a valid ServerHello (0x16) for `domain` does it
+// open a clean, 0-byte pre-warmed socket and store it in warmPool!
+func (r *VIPResolver) verifyAndWarmAnycastCloak(link LinkType, domain, canonicalIP string) {
+	if !GlobalPrivacy.AnycastCloakEnabled() || domain == "" || net.ParseIP(domain) != nil {
+		return
+	}
 	parsed := net.ParseIP(canonicalIP)
 	if !isCloudflareAnycast(parsed) {
 		return
 	}
 	var rnd [2]byte
-	_, _ = rand.Read(rnd[:])
-	// Alternate between a shared high-traffic Cloudflare Front IP (completely
-	// hiding the target's /24 subnet from the ISP) and a /24 sibling IP.
+	GlobalPrivacy.FillCryptoRandom(rnd[:])
 	var cloakIP string
 	if rnd[0]&1 == 0 {
 		cloakIP = sharedCloudflareFronts[int(rnd[1])%len(sharedCloudflareFronts)]
@@ -537,18 +509,38 @@ func (r *VIPResolver) maybeWarmAnycastSibling(link LinkType, canonicalIP string)
 		cloakIP = net.IPv4(v4[0], v4[1], v4[2], sib).String()
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+		// Step 1: Silent verification probe with a disposable CSPRNG ClientHello
+		probeCtx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
 		defer cancel()
-		d := NewBoundDialer(r.binder, link, 350*time.Millisecond)
-		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(cloakIP, "443"))
-		if err != nil || conn == nil {
+		d := NewBoundDialer(r.binder, link, 400*time.Millisecond)
+		probeConn, err := d.DialContext(probeCtx, "tcp", net.JoinHostPort(cloakIP, "443"))
+		if err != nil || probeConn == nil {
 			return
 		}
-		if tc, ok := conn.(*net.TCPConn); ok {
+		probePkt := BuildProbeClientHello(domain)
+		_ = probeConn.SetDeadline(time.Now().Add(350 * time.Millisecond))
+		_, wErr := probeConn.Write(probePkt)
+		var hdr [5]byte
+		rn, rErr := probeConn.Read(hdr[:])
+		_ = probeConn.Close()
+		if wErr != nil || rErr != nil || rn < 3 || hdr[0] != 0x16 {
+			// Candidate cloak IP rejected the SNI (e.g. TLS Alert 0x15); discard it
+			// so the user's real connection NEVER hits an alert or replays its nonce!
+			return
+		}
+		// Step 2: Candidate cloak IP is verified to serve `domain`! Open a clean,
+		// 0-byte socket and place it into warmPool under canonicalIP.
+		warmCtx, wCancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		defer wCancel()
+		cleanConn, err := d.DialContext(warmCtx, "tcp", net.JoinHostPort(cloakIP, "443"))
+		if err != nil || cleanConn == nil {
+			return
+		}
+		if tc, ok := cleanConn.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 		}
-		armKeepAlive(conn)
-		PutWarmConn(link, canonicalIP, "443", conn)
+		armKeepAlive(cleanConn)
+		PutWarmConn(link, canonicalIP, "443", cleanConn)
 	}()
 }
 
@@ -557,13 +549,11 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 	if preferV6 {
 		qtypes = []uint16{28, 1}
 	}
-
 	type dnsOut struct {
 		ips      []net.IP
 		priority int
 	}
 	outCh := make(chan dnsOut, 2)
-
 	for idx, qt := range qtypes {
 		go func(qtype uint16, prio int) {
 			if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
@@ -573,10 +563,8 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 			}
 		}(qt, idx+1)
 	}
-
 	dohTimer := time.NewTimer(1100 * time.Millisecond)
 	defer dohTimer.Stop()
-
 	var fallback []net.IP
 	for i := 0; i < 2; i++ {
 		select {
@@ -593,7 +581,6 @@ func (r *VIPResolver) lookupOnLink(ctx context.Context, domain string, link Link
 			if len(fallback) > 0 {
 				return fallback
 			}
-			// Cross-link DoH rescue before ever touching UDP/53:
 			otherLink := LinkCellular
 			if link == LinkCellular {
 				otherLink = LinkWiFi
@@ -614,6 +601,11 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 	if len(wireReq) == 0 {
 		return nil
 	}
+	// 1. Try RFC 9230 Oblivious DoH (HPKE X25519 + AES-128-GCM) first:
+	if ips := r.queryODoHOnLink(ctx, wireReq, txID, link); len(ips) > 0 {
+		return ips
+	}
+	// 2. Zero-latency fallback to sharded, EDNS0-padded DoH providers:
 	providers := dohProvidersWiFi
 	if link == LinkCellular {
 		providers = dohProvidersCell
@@ -622,7 +614,11 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		return nil
 	}
 	start := int(r.dohNext.Add(1) % uint64(len(providers)))
-
+	// Generate randomized HTTP/2 header padding so DoH frame lengths are
+	// decorrelated across queries even if HPACK compresses standard headers.
+	var padRnd [32]byte
+	GlobalPrivacy.FillCryptoRandom(padRnd[:])
+	padHeader := base64.RawURLEncoding.EncodeToString(padRnd[:8+int(padRnd[0]&0x0F)])
 	for attempt := 0; attempt < len(providers); attempt++ {
 		p := providers[(start+attempt)%len(providers)]
 		client := r.dohClients[dohClientKey(link, p.url)]
@@ -635,7 +631,7 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 		}
 		req.Header.Set("Content-Type", "application/dns-message")
 		req.Header.Set("Accept", "application/dns-message")
-
+		req.Header.Set("X-Padding", padHeader)
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
@@ -653,9 +649,66 @@ func (r *VIPResolver) queryDoHOnLink(ctx context.Context, domain string, qtype u
 	return nil
 }
 
+// queryODoHOnLink seals the DNS wire query with RFC 9180 HPKE (X25519 + AES-128-GCM)
+// and transmits it as an RFC 9230 application/oblivious-dns-message.
+func (r *VIPResolver) queryODoHOnLink(ctx context.Context, wireReq []byte, txID uint16, link LinkType) []net.IP {
+	cfg := GlobalODoH.GetTargetConfig(r, link)
+	if cfg == nil {
+		return nil
+	}
+	odohReq, cctx, err := cfg.SealQuery(wireReq)
+	if err != nil {
+		return nil
+	}
+	// Select the bound HTTP/2 client on this link to carry the oblivious message.
+	endpointURL := "https://1.1.1.1/dns-query"
+	if link == LinkCellular {
+		endpointURL = "https://[2606:4700:4700::1111]/dns-query"
+	}
+	client := r.dohClients[dohClientKey(link, endpointURL)]
+	if client == nil {
+		client = r.dohClients[dohClientKey(link, "https://1.1.1.1/dns-query")]
+	}
+	if client == nil {
+		return nil
+	}
+	GlobalODoH.mu.RLock()
+	proxyURL := GlobalODoH.proxyURL
+	targetHost := GlobalODoH.targetHost
+	targetPath := GlobalODoH.targetPath
+	GlobalODoH.mu.RUnlock()
+	reqURL := endpointURL
+	if proxyURL != "" {
+		reqURL = proxyURL + "?targethost=" + targetHost + "&targetpath=" + targetPath
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(odohReq))
+	if err != nil {
+		return nil
+	}
+	if proxyURL == "" && targetHost != "" {
+		req.Host = targetHost
+	}
+	req.Header.Set("Content-Type", "application/oblivious-dns-message")
+	req.Header.Set("Accept", "application/oblivious-dns-message")
+	req.Header.Set("Cache-Control", "no-cache, no-store")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	status := resp.StatusCode
+	resp.Body.Close()
+	if err != nil || status != http.StatusOK {
+		return nil
+	}
+	dnsResp, err := cctx.OpenResponse(body)
+	if err != nil {
+		return nil
+	}
+	return parseDNSResponsePacket(dnsResp, txID)
+}
+
 func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype uint16, link LinkType) []net.IP {
-	// Zero-plaintext policy: legacy callers (e.g. the RRC keep-awake pacer)
-	// are routed through encrypted DoH so UDP/53 is never leaked.
 	if ips := r.queryDoHOnLink(ctx, domain, qtype, link); len(ips) > 0 {
 		return ips
 	}
@@ -664,9 +717,8 @@ func (r *VIPResolver) queryUDPOnLink(ctx context.Context, domain string, qtype u
 
 func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uint16) {
 	var randBytes [2]byte
-	_, _ = rand.Read(randBytes[:])
+	GlobalPrivacy.FillCryptoRandom(randBytes[:])
 	txID := binary.BigEndian.Uint16(randBytes[:])
-
 	var buf bytes.Buffer
 	var hdr [12]byte
 	binary.BigEndian.PutUint16(hdr[0:2], txID)
@@ -676,7 +728,6 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 		binary.BigEndian.PutUint16(hdr[10:12], 1)
 	}
 	buf.Write(hdr[:])
-
 	labels := strings.Split(strings.TrimSuffix(domain, "."), ".")
 	for _, label := range labels {
 		if len(label) == 0 || len(label) > 63 {
@@ -686,12 +737,10 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 		buf.WriteString(label)
 	}
 	buf.WriteByte(0)
-
 	var qtail [4]byte
 	binary.BigEndian.PutUint16(qtail[0:2], qtype)
 	binary.BigEndian.PutUint16(qtail[2:4], 1)
 	buf.Write(qtail[:])
-
 	if padEDNS {
 		curLen := buf.Len() + 15
 		padLen := (128 - (curLen % 128)) % 128
@@ -701,20 +750,16 @@ func buildDNSQueryPacket(domain string, qtype uint16, padEDNS bool) ([]byte, uin
 		binary.BigEndian.PutUint16(optHdr[2:4], 1232)
 		binary.BigEndian.PutUint16(optHdr[8:10], uint16(4+padLen))
 		buf.Write(optHdr[:])
-
 		var padOpt [4]byte
 		binary.BigEndian.PutUint16(padOpt[0:2], 12)
 		binary.BigEndian.PutUint16(padOpt[2:4], uint16(padLen))
 		buf.Write(padOpt[:])
 		if padLen > 0 {
-			// Fill EDNS0 padding with cryptographic pseudorandom bytes instead
-			// of 0x00 so TLS compression/entropy side-channels learn nothing.
 			noise := make([]byte, padLen)
 			GlobalPrivacy.FillCryptoRandom(noise)
 			buf.Write(noise)
 		}
 	}
-
 	return buf.Bytes(), txID
 }
 
@@ -728,7 +773,6 @@ func parseDNSResponsePacket(pkt []byte, expectedTxID uint16) []net.IP {
 	qdCount := int(binary.BigEndian.Uint16(pkt[4:6]))
 	anCount := int(binary.BigEndian.Uint16(pkt[6:8]))
 	offset := 12
-
 	for i := 0; i < qdCount; i++ {
 		next, ok := skipDNSName(pkt, offset)
 		if !ok || next+4 > len(pkt) {
@@ -736,7 +780,6 @@ func parseDNSResponsePacket(pkt []byte, expectedTxID uint16) []net.IP {
 		}
 		offset = next + 4
 	}
-
 	var ips []net.IP
 	for i := 0; i < anCount; i++ {
 		next, ok := skipDNSName(pkt, offset)

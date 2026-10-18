@@ -180,20 +180,30 @@ type raceResult struct {
 // and sets TCP_NODELAY.
 var cellDualExitToggle atomic.Uint64
 
-// DialLinkConn dials a single link and stripes Cellular IPv4 connections across
-// BOTH the Carrier's Hardware NAT64 Border Exit (SynthesizeCarrierNAT64) and
-// native CGNAT IPv4, with instant fallback if either path is unsupported.
+// DialLinkConn dials a single link, routing through the link's configured
+// Orthogonal Privacy Egress if present, or striping Cellular IPv4 connections
+// across both the Carrier's Hardware NAT64 Border Exit and native CGNAT IPv4.
+// Every returned connection is wrapped in MorphingConn for L4 stream morphing.
 func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, fallbackIPv4, port string) (net.Conn, error) {
-	if port == "443" {
-		FireGhostTTLClientHello(binder, link, net.JoinHostPort(ip, port))
-	}
 	if c := popWarmConn(link, ip, port); c != nil {
-		return c, nil
+		return WrapMorphingConn(c, link), nil
 	}
 	d := NewBoundDialer(binder, link, 4*time.Second)
-	// ISP-Level Dual-Exit Striping on Cellular: alternate between the Carrier's
-	// Hardware NAT64 Border Gateway (64:ff9b::/96 -> distinct public exit IPv4 pool)
-	// and local CGNAT IPv4, with instant fallback so it never fails on IPv4-only SIMs.
+	egress := GlobalPrivacy.EgressForLink(link)
+	// If an Orthogonal Privacy Egress relay is configured for this radio,
+	// route through the camouflaged tunnel so the destination website never
+	// sees the client IP while preserving dual-radio bandwidth compounding.
+	if egress != nil && egress.Address != "" {
+		c, err := DialThroughPrivacyEgress(ctx, d, egress, "tcp", net.JoinHostPort(ip, port))
+		if err == nil && c != nil {
+			armKeepAlive(c)
+			return WrapMorphingConn(c, link), nil
+		}
+		return nil, err
+	}
+	// Zero-VPS Direct Mode: ISP-Level Dual-Exit Striping on Cellular alternates
+	// between the Carrier's Hardware NAT64 Border Gateway (64:ff9b::/96) and
+	// local CGNAT IPv4, with instant fallback on IPv4-only SIMs.
 	if link == LinkCellular {
 		parsed := net.ParseIP(ip)
 		if parsed != nil && parsed.To4() != nil && cellDualExitToggle.Add(1)%2 == 0 {
@@ -206,7 +216,7 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 						_ = tc.SetNoDelay(true)
 					}
 					armKeepAlive(c)
-					return c, nil
+					return WrapMorphingConn(c, link), nil
 				}
 			}
 		}
@@ -227,8 +237,9 @@ func DialLinkConn(ctx context.Context, binder SocketBinder, link LinkType, ip, f
 			_ = tc.SetNoDelay(true)
 		}
 		armKeepAlive(c)
+		return WrapMorphingConn(c, link), nil
 	}
-	return c, err
+	return nil, err
 }
 
 // DialSpeculativeDualLink dials Wi-Fi and Cellular for a new flow. When stagger > 0
